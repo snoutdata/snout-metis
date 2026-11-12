@@ -1,0 +1,31 @@
+# snout-metis's fuzz targets, run by scripts/fuzz.sh with cargo-fuzz on a pinned nightly.
+# Its own workspace, so the nightly-only libFuzzer build never touches the crate's.
+[package]
+name = "snout-metis-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+snout-metis = { path = ".." }
+tokio = { version = "1", features = ["rt", "io-util"] }
+
+[workspace]
+
+[[bin]]
+name = "metis_decide"
+path = "fuzz_targets/metis_decide.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metis_report"
+path = "fuzz_targets/metis_report.rs"
+test = false
+doc = false
+bench = false
