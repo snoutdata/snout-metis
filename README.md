@@ -131,6 +131,40 @@ optionally the `run` block an agent runs them from), and the `agents` admitted b
 copies than `MAX_INSTANCES`, a placement no host can take, a secret where only a file name may go.
 The types and every rule are in `src/spec.rs`.
 
+Four things taken from Kubernetes, each off unless the spec names it (`src/orchestration_tests.rs`
+holds their cases):
+
+- **Requests, limits and QoS.** `per_copy` is what a copy reserves (the request; placement packs by
+  it), `limit` the most it may use. Together they class it: best effort (reserves nothing),
+  burstable, guaranteed (limit = request). With `pressure_percent`, a host whose running copies use
+  more than that share of its capacity (the agents' `load`) has copies moved off it: best effort
+  first, then burstable by how far past its request it runs, the lowest priority first, never a
+  guaranteed or one-clock copy, and nothing new placed there. Make before break, as a drain.
+- **Priority and preemption.** A service's `priority` (0 to `MAX_PRIORITY`) is the order services
+  keep and take room in. When no host has room for a copy of a priority above 0, it takes the room
+  of the fewest, lowest-priority copies on one host (strictly lower only); they are placed elsewhere
+  in their own turn if anywhere has room, and the note says who gave way to whom.
+- **The rebalancer.** With `rebalance` (`high_percent`, `low_percent`), once every placed copy runs
+  steady and nothing else moves, one environment's copies on the most reserved host past
+  `high_percent` move to the least reserved host under `low_percent` that can take them all (each
+  service's own rules, one copy per host, a fault domain no fuller than the one left, never the
+  environment's database host), make before break. One move at a time: the decision names it in
+  `moves`, the leader carries it into the next decision's facts, and it ends when the old copies go.
+- **Rollouts.** A service's `rollout`: `max_unavailable` hosts change version at once (1 by default,
+  as before), `max_surge` copies of the new version go to hosts holding none of the service beside
+  the old ones, and with `rollback`, an agent giving up on a copy of a version while an older one
+  still runs rolls the service back to it (`rollbacks`, carried by the leader like `moves`) until the
+  spec changes that version. Without a `rollout`, a version change is one host at a time, no surge,
+  no rollback.
+
+**Why a copy is not placed.** A decision that places a version short of its target lists it in
+`shortfalls`: every host of the spec and the first reason it took no more copies (not reporting,
+another customer's, not on its list, draining, frozen, under pressure, already holding its copy,
+full...), with its free room, its capacity and, when the spec gives a host's `server`, the whole
+machine. Its note ends with the same reasons, counted. A host's `server` and `owner` are only said,
+never placed by: on the fleet, `capacity` is what the databases leave, so a full host is told apart
+from a small one.
+
 ## HTTP API
 
 All calls take `Authorization: Bearer <token>`; a wrong or missing one is `401 {"error":"not allowed"}`.

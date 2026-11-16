@@ -303,6 +303,8 @@ mod tests {
 			frozen: false,
 			finishing: false,
 			dedicated_to: None,
+			server: None,
+			owner: None,
 			capacity: Resources::default(),
 		};
 		Spec {
@@ -315,6 +317,8 @@ mod tests {
 			services: vec![],
 			database_cluster: cluster.map(Into::into),
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		}
 	}
 

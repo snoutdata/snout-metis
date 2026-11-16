@@ -607,8 +607,10 @@ async fn status(State(member): State<Member>, headers: HeaderMap) -> Response {
 		"id": member.config.id,
 		"version": env!("CARGO_PKG_VERSION"),
 		// What this build decides that an older one does not, for an operator's preflight to read (the
-		// version is the crate's, which no change bumps): `draining` is packing's make-before-break.
-		"features": ["draining"],
+		// version is the crate's, which no change bumps): `draining` is packing's make-before-break;
+		// `orchestration` is limits and pressure, priority, the rebalancer and rollouts (spec.rs);
+		// `shortfalls` is each decision's hosts and why they refused (decide.rs).
+		"features": ["draining", "orchestration", "shortfalls"],
 		"now_ms": now,
 		"started_ms": member.started_ms,
 		"state": format!("{:?}", metrics.state),
@@ -622,7 +624,7 @@ async fn status(State(member): State<Member>, headers: HeaderMap) -> Response {
 		"about": member.config.about,
 		"has_spec": state.spec.is_some(),
 		"spec": state.spec,
-		"decision": state.decision.as_ref().map(|d| json!({"at_ms": d.at_ms, "by": d.by, "notes": d.outcome.notes, "placement": d.outcome.placement, "database": d.database, "projects": d.projects})),
+		"decision": state.decision.as_ref().map(|d| json!({"at_ms": d.at_ms, "by": d.by, "notes": d.outcome.notes, "placement": d.outcome.placement, "moves": d.outcome.moves, "rollbacks": d.outcome.rollbacks, "shortfalls": d.outcome.shortfalls, "database": d.database, "projects": d.projects})),
 		"history": recent.iter().map(|d| json!({"at_ms": d.at_ms, "by": d.by, "notes": d.outcome.notes})).collect::<Vec<_>>(),
 		"reports": reports,
 		"copies": copies,

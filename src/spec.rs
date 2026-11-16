@@ -21,6 +21,84 @@ pub struct Spec {
 	/// files (`agent_tokens`): a fleet copy host's, given at its enrolment. The control plane keeps only each token's sha256, and so does this.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub agents: Vec<SpecAgent>,
+	/// Eviction under pressure (QoS): a host whose running copies USE more than this percent of its
+	/// capacity (CPU or memory, as the agents measure it) has copies moved off it, best-effort ones
+	/// first, then burstable ones by how far past their request they run, the lowest priority first
+	/// within a class, never a guaranteed one ([`Qos`]). Make before break, as a drain. None: off.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub pressure_percent: Option<u32>,
+	/// The rebalancer (a descheduler): with nothing on its way up, an environment's copies on the most
+	/// reserved host past `high_percent` move to the least reserved one under `low_percent`, one move at
+	/// a time, make before break. None: off, and a running copy only moves when it must.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rebalance: Option<Rebalance>,
+}
+
+/// The rebalancer's band, in percent of a host's capacity its placed copies reserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rebalance {
+	#[serde(default = "default_high_percent")]
+	pub high_percent: u32,
+	#[serde(default = "default_low_percent")]
+	pub low_percent: u32,
+}
+
+fn default_high_percent() -> u32 {
+	80
+}
+
+fn default_low_percent() -> u32 {
+	50
+}
+
+/// How a copy is treated when its host runs short, from what it reserves (`per_copy`, the request)
+/// and the most it may use (`limit`), as Kubernetes classes pods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Qos {
+	/// Reserves nothing: the first moved off a host under pressure.
+	BestEffort,
+	/// Reserves something, and may use more (no limit, or a limit above it).
+	Burstable,
+	/// Its limit is what it reserves: never moved for pressure.
+	Guaranteed,
+}
+
+/// How a version change rolls through a service's copies. None is one host at a time, no extra
+/// copy, no rollback: what every spec before this field had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rollout {
+	/// Copies of the new version placed on hosts that hold none of the service, beside the old ones,
+	/// before an old one is let go.
+	#[serde(default)]
+	pub max_surge: u32,
+	/// Hosts whose old copy may be let go in one decision, while nothing placed is on its way up.
+	#[serde(default = "one")]
+	pub max_unavailable: u32,
+	/// When an agent gives up on a copy of a new version while another version still runs, the
+	/// service rolls back to that one until the spec changes the version ([`Rollback`]).
+	#[serde(default, skip_serializing_if = "is_false")]
+	pub rollback: bool,
+}
+
+/// A rollout that was rolled back: `from` gave up, its share goes to `to`. Carried by the members
+/// from one decision to the next (`Facts::rollbacks`) while the spec still names `from`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Rollback {
+	pub from: String,
+	pub to: String,
+}
+
+/// A rebalancer's move in flight: every copy of `environment` on `from` goes to `to`, and the one on
+/// `from` stays until its replacement runs steady. Carried by the members from one decision to the
+/// next (`Facts::moves`) until it is done or no longer possible.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Move {
+	pub environment: String,
+	pub from: String,
+	pub to: String,
 }
 
 /// One agent the spec admits: its host, the sha256 of its token (lowercase hex) and the public
@@ -70,6 +148,14 @@ pub struct HostSpec {
 	pub dedicated_to: Option<String>,
 	/// What the host has for copies, after what it keeps for itself.
 	pub capacity: Resources,
+	/// The whole server, before what the host and its databases keep: only said (why a host is
+	/// full, `decide.rs`'s shortfalls), never placed by. None from a spec that does not say.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub server: Option<Resources>,
+	/// The customer whose server it is when a list keeps it for them rather than `dedicated_to` (the
+	/// fleet's pools, sql/337): only said, never placed by.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub owner: Option<String>,
 }
 
 fn serves_by_default() -> bool {
@@ -142,6 +228,24 @@ pub struct ServiceSpec {
 	/// control plane's own environment may have ([`Spec::check`]).
 	#[serde(default, skip_serializing_if = "Policy::is_spread")]
 	pub policy: Policy,
+	/// The most one copy may use; `per_copy` is what it reserves (the request). Together they give its
+	/// [`Qos`]. None: it may use more than it reserves (burstable), or reserves nothing (best effort).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub limit: Option<Resources>,
+	/// Higher is placed first, and takes the room of lower ones when there is none left (preemption):
+	/// their copies on that host go, and are placed elsewhere if anywhere has room. 0, the default,
+	/// never preempts anything.
+	#[serde(default, skip_serializing_if = "is_zero_u32")]
+	pub priority: u32,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rollout: Option<Rollout>,
+}
+
+/// The highest priority a spec may give, a bound in the binary.
+pub const MAX_PRIORITY: u32 = 1_000_000;
+
+fn is_zero_u32(n: &u32) -> bool {
+	*n == 0
 }
 
 /// The environment of the control plane's own services, whose copies ARE its failover: always spread.
@@ -346,6 +450,23 @@ impl Spec {
 				));
 			}
 		}
+		if let Some(percent) = self.pressure_percent
+			&& (percent == 0 || percent > 100)
+		{
+			return Err(format!(
+				"pressure_percent {percent} is a percent of a host's capacity, 1 to 100"
+			));
+		}
+		if let Some(band) = self.rebalance
+			&& (band.high_percent == 0
+				|| band.high_percent > 100
+				|| band.low_percent >= band.high_percent)
+		{
+			return Err(format!(
+				"rebalance: low_percent {} must be below high_percent {}, which is 1 to 100",
+				band.low_percent, band.high_percent
+			));
+		}
 		let mut services = BTreeSet::new();
 		for service in &self.services {
 			let id = service.id();
@@ -379,6 +500,7 @@ impl Spec {
 				check_scale(service, scale)?;
 			}
 			check_policy(service)?;
+			check_qos(service)?;
 			self.check_placement(service)?;
 			if let Some(run) = &service.run {
 				self.check_run(service, run)?;
@@ -616,6 +738,52 @@ fn check_scale(service: &ServiceSpec, scale: &Scale) -> Result<(), String> {
 	Ok(())
 }
 
+/// A limit is at least what a copy reserves, a priority within its bound, and a rollout that can
+/// move: at least one host at a time, a surge within what a service may have.
+fn check_qos(service: &ServiceSpec) -> Result<(), String> {
+	let id = service.id();
+	if let Some(limit) = service.limit {
+		if !limit.fits(service.per_copy) {
+			return Err(format!(
+				"{id}: its limit is below what a copy reserves (per_copy)"
+			));
+		}
+		if let Some(run) = &service.run
+			&& limit.memory_mb != run.memory_mb
+		{
+			return Err(format!(
+				"{id}: its memory limit {} is not the {} MB its agent runs it with",
+				limit.memory_mb, run.memory_mb
+			));
+		}
+	}
+	if service.priority > MAX_PRIORITY {
+		return Err(format!(
+			"{id}: priority {} is above {MAX_PRIORITY}",
+			service.priority
+		));
+	}
+	if let Some(rollout) = service.rollout {
+		if rollout.max_unavailable == 0 {
+			return Err(format!(
+				"{id}: max_unavailable 0 would never let an old copy go"
+			));
+		}
+		if rollout.max_surge > MAX_INSTANCES {
+			return Err(format!(
+				"{id}: max_surge {} is above {MAX_INSTANCES}",
+				rollout.max_surge
+			));
+		}
+		if service.one_clock && rollout.max_surge > 0 {
+			return Err(format!(
+				"{id}: a one-clock service never runs a second copy, so no surge"
+			));
+		}
+	}
+	Ok(())
+}
+
 /// The agent's `assertServiceName`.
 fn is_service_name(name: &str) -> bool {
 	let mut chars = name.chars();
@@ -628,6 +796,17 @@ impl ServiceSpec {
 	/// `environment/name`, the key a service is known by in notes and in the table.
 	pub fn id(&self) -> String {
 		format!("{}/{}", self.environment, self.name)
+	}
+
+	/// Its class when a host runs short ([`Qos`]).
+	pub fn qos(&self) -> Qos {
+		if self.per_copy == Resources::default() {
+			Qos::BestEffort
+		} else if self.limit == Some(self.per_copy) {
+			Qos::Guaranteed
+		} else {
+			Qos::Burstable
+		}
 	}
 }
 
@@ -646,6 +825,12 @@ pub struct Facts {
 	/// (`database.rs`, `project_primaries`); an environment without one uses the region above.
 	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
 	pub database_hosts: BTreeMap<String, String>,
+	/// The rebalancer's move in flight, from the last decision (`Outcome::moves`).
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub moves: Vec<Move>,
+	/// Rollouts rolled back, by service id, from the last decision (`Outcome::rollbacks`).
+	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+	pub rollbacks: BTreeMap<String, Rollback>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

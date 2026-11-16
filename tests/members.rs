@@ -33,6 +33,8 @@ fn spec() -> Spec {
 			millicpu: 1000,
 			memory_mb: 1024,
 		},
+		server: None,
+		owner: None,
 	};
 	Spec {
 		host_timeout_secs: 1,
@@ -65,9 +67,14 @@ fn spec() -> Spec {
 			routed: true,
 			scale: None,
 			policy: Default::default(),
+			limit: None,
+			priority: 0,
+			rollout: None,
 		}],
 		database_cluster: None,
 		agents: Vec::new(),
+		pressure_percent: None,
+		rebalance: None,
 	}
 }
 
@@ -1896,4 +1903,100 @@ async fn every_member_pushes_the_table_to_the_routers() {
 		wrongly.lock().expect("lock").is_empty(),
 		"a router whose certificate is not the pinned one was sent the table"
 	);
+}
+
+/// A version an agent gives up on is rolled back, and the leader carries the rollback from one
+/// decision to the next (`Outcome::rollbacks` into `Facts::rollbacks`): once the given-up copy is
+/// gone from the reports, the service stays on the old version rather than rolling forward again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rollback_is_carried_from_one_decision_to_the_next() {
+	let c = cluster(None).await;
+	let init = c
+		.http
+		.post(format!("{}/init", c.members[0].2))
+		.bearer_auth(OPERATOR)
+		.send()
+		.await
+		.expect("init");
+	assert!(init.status().is_success());
+	let leader = c.leader().await;
+	let mut rolling = spec();
+	rolling.services[0].versions[0].version = "0.2.2".into();
+	rolling.services[0].rollout = Some(metis::spec::Rollout {
+		max_surge: 0,
+		max_unavailable: 1,
+		rollback: true,
+	});
+	let applied = c
+		.http
+		.post(format!("{}/spec", c.members[leader].2))
+		.bearer_auth(OPERATOR)
+		.json(&rolling)
+		.send()
+		.await
+		.expect("spec");
+	assert!(applied.status().is_success());
+
+	let images = |d: Option<Value>| -> Vec<String> {
+		d.and_then(|d| d["hostServices"].as_array().cloned())
+			.unwrap_or_default()
+			.iter()
+			.filter_map(|e| e["image"].as_str().map(String::from))
+			.collect()
+	};
+	let gave_up = serde_json::json!([{"environment": "control-plane", "service": "functions", "version": "0.2.2", "state": "gave-up"}]);
+	let mut back = false;
+	for _ in 0..80 {
+		for (member, _, address) in &c.members {
+			if member.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+				continue;
+			}
+			let _ = c
+				.http
+				.post(format!("{address}/report/h1"))
+				.bearer_auth(agent_token("h1"))
+				.json(&gave_up)
+				.send()
+				.await;
+		}
+		c.report("h2", functions_running()).await;
+		c.report("h3", vec![]).await;
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		if images(c.desired(leader, "h3").await) == ["example/functions:0.2.1"] {
+			back = true;
+			break;
+		}
+	}
+	assert!(back, "no rollback to 0.2.1");
+
+	// The given-up copy is gone (h1's agent was told to stop it): still 0.2.1, decision after decision.
+	for _ in 0..30 {
+		c.report("h1", vec![]).await;
+		c.report("h2", functions_running()).await;
+		c.report("h3", functions_running()).await;
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	for host in ["h1", "h2", "h3"] {
+		assert!(
+			!images(c.desired(leader, host).await)
+				.iter()
+				.any(|i| i.ends_with(":0.2.2")),
+			"{host} rolled forward again"
+		);
+	}
+	let log: Value = c
+		.http
+		.get(format!("{}/log", c.members[leader].2))
+		.bearer_auth(OPERATOR)
+		.send()
+		.await
+		.expect("log")
+		.json()
+		.await
+		.expect("json");
+	assert!(log.to_string().contains("rolled back to 0.2.1"), "{log}");
+	for (member, server, _) in &c.members {
+		member.stop().await;
+		server.abort();
+	}
 }

@@ -258,6 +258,9 @@ mod tests {
 			routed: true,
 			scale: None,
 			policy: Default::default(),
+			limit: None,
+			priority: 0,
+			rollout: None,
 		}
 	}
 
@@ -272,6 +275,8 @@ mod tests {
 			frozen: false,
 			finishing: false,
 			dedicated_to: None,
+			server: None,
+			owner: None,
 			capacity: Resources {
 				millicpu: 2000,
 				memory_mb: 2048,
@@ -283,6 +288,8 @@ mod tests {
 			services,
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		}
 	}
 
@@ -402,6 +409,8 @@ mod tests {
 			],
 			database_primary_region: None,
 			database_hosts: Default::default(),
+			moves: Vec::new(),
+			rollbacks: Default::default(),
 		};
 		let outcome = crate::decide(&s, &facts);
 		assert!(outcome.notes.is_empty(), "{:?}", outcome.notes);

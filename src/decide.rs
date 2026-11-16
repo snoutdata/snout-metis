@@ -8,9 +8,12 @@
 //! takes as few copies of one service as possible. Every choice breaks ties by name, so the same
 //! input always gives the same output.
 
-use crate::spec::{CopyFacts, CopyState, Facts, HostSpec, PlaceMode, Resources, ServiceSpec, Spec};
+use crate::spec::{
+	CopyFacts, CopyState, Facts, HostSpec, Move, PlaceMode, Qos, Rebalance, Resources, Rollback,
+	ServiceSpec, Spec, VersionShare,
+};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// `count` copies of one version of one service, on one host: what that host's agent is told to run.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -57,6 +60,104 @@ pub struct Outcome {
 	/// to keep its file (`server.rs`). Empty in a decision from a member before this field.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub heard: Vec<String>,
+	/// The rebalancer's move in flight, which the next decision carries on (`Facts::moves`).
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub moves: Vec<Move>,
+	/// Rollouts rolled back, by service id, which the next decision keeps (`Facts::rollbacks`).
+	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+	pub rollbacks: BTreeMap<String, Rollback>,
+	/// Each version of a service placed short of its target, with every host the decision
+	/// considered and why it took no more copies: what the admin console's hosts, the shortfall
+	/// alert and the dashboard read, so none of them guesses why.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub shortfalls: Vec<Shortfall>,
+}
+
+/// One version of one service a decision could not give every copy it wants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Shortfall {
+	/// The service id (`environment/name`).
+	pub service: String,
+	pub version: String,
+	pub wanted: u32,
+	pub placed: u32,
+	/// What one more copy needs (`per_copy`).
+	pub needs: Resources,
+	/// Every host of the spec, and why it took no more copies, in the spec's order.
+	pub hosts: Vec<Refusal>,
+}
+
+/// One host's answer to one more copy of a service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+	pub host: String,
+	pub reason: Refused,
+	/// Whose host it is, when it is dedicated to a customer.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub dedicated_to: Option<String>,
+	pub capacity: Resources,
+	/// What is left on it after this decision's placements so far.
+	pub free: Resources,
+	/// The whole server, when the spec says (`HostSpec::server`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub server: Option<Resources>,
+}
+
+/// Why a host took no more copies of a service. The first that applies, in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Refused {
+	/// Not heard within the host timeout.
+	NotReporting,
+	/// Dedicated to another customer.
+	Dedicated,
+	/// A shared host, and the service runs only on its customer's dedicated hosts.
+	Shared,
+	/// Not on the service's list of hosts or regions (`placement`). On the fleet, a pool's servers
+	/// are kept off a shared project's list this way (sql/337).
+	NotOnItsList,
+	/// Being emptied to retire.
+	Draining,
+	/// Serves nothing (a witness host, or closed).
+	NotServing,
+	/// Its agent gave up on this service there.
+	GaveUp,
+	/// The service's copies are moving off it (pressure, the rebalancer).
+	MovingOff,
+	/// Full and held as it is: nothing new goes there.
+	Frozen,
+	/// Its agent only reports.
+	OnlyReports,
+	/// Its copies use more than `pressure_percent` of it.
+	UnderPressure,
+	/// A higher priority took this service's room there.
+	Preempted,
+	/// Already holds as many copies of this service as one host may.
+	HoldsItsShare,
+	/// Not enough CPU or memory left for one more copy.
+	Full,
+}
+
+impl Refused {
+	/// A few words for the note, after a count.
+	fn words(self) -> &'static str {
+		match self {
+			Refused::NotReporting => "not reporting",
+			Refused::Dedicated => "dedicated to another customer",
+			Refused::Shared => "shared, and it runs only on its customer's own hosts",
+			Refused::NotOnItsList => "not on its list of hosts",
+			Refused::Draining => "draining",
+			Refused::NotServing => "serving nothing",
+			Refused::GaveUp => "where its agent gave up on it",
+			Refused::MovingOff => "it is moving off",
+			Refused::Frozen => "frozen",
+			Refused::OnlyReports => "only reporting",
+			Refused::UnderPressure => "under pressure",
+			Refused::Preempted => "taken by a higher priority",
+			Refused::HoldsItsShare => "already holding its copy",
+			Refused::Full => "full",
+		}
+	}
 }
 
 /// How long a copy must have run and answered its health before a draining host's copy of the same
@@ -127,18 +228,37 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 	let mut placement = Vec::new();
 	// (service id, host, version) -> share: an old version a host keeps through a roll (below).
 	let mut held: BTreeMap<(String, String, String), u32> = BTreeMap::new();
+	// The highest priority first, so it keeps and takes room before the lower ones; then by id. With
+	// every priority 0 this is the order by id it always was.
 	let mut services: Vec<&ServiceSpec> = spec.services.iter().collect();
-	services.sort_by_key(|s| s.id());
+	services.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.id().cmp(&b.id())));
+
+	// Rollbacks: the ones the last decision made, while the spec still names the version that gave
+	// up, and the new ones this decision finds. Each service's versions as this decision places them.
+	let rollbacks = rollbacks(spec, facts, &alive, &copies, &mut notes);
+	let shares: BTreeMap<String, Vec<VersionShare>> = spec
+		.services
+		.iter()
+		.map(|s| {
+			let id = s.id();
+			let versions = effective_versions(s, rollbacks.get(&id));
+			(id, versions)
+		})
+		.collect();
+	// Hosts whose copies use more than the spec lets them (QoS), and the services moved off each.
+	let pressure = pressure(spec, facts, &alive, &report_only, &mut notes);
+	// The rebalancer's move in flight, if it can still be made.
+	let moves = live_moves(spec, &alive, &report_only, facts, &mut notes);
 
 	// First what runs, for every service, then what is missing. At fleet size one decision holds
 	// many environments on the same hosts, and a copy that runs is never moved to make room for a
 	// copy that does not yet: a new project's copies take what the running ones leave.
-	let mut plans: Vec<ServicePlan> = Vec::with_capacity(services.len());
+	let mut plans: VecDeque<ServicePlan> = VecDeque::with_capacity(services.len());
 	for service in services {
 		let id = service.id();
 		let mut said = Vec::new();
 		let wanted = wanted_copies(service, facts, &alive, &mut said);
-		let targets = version_targets(service, wanted);
+		let targets = version_targets(&shares[&id], wanted);
 		let gave_up: BTreeSet<&str> = copies
 			.hosts_of(service)
 			.iter()
@@ -150,6 +270,25 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 				"{id}: the agent on {host} gave up on it; placed on another host"
 			));
 		}
+		// Hosts its copies move off, make before break: one under pressure that sheds this service,
+		// or the rebalancer's `from` for its environment (with the host it goes to first).
+		let mut off: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+		for (host, ids) in &pressure.shed {
+			if ids.contains(&id) {
+				off.insert(host, None);
+			}
+		}
+		for m in &moves {
+			if m.environment == service.environment
+				&& copies
+					.on(&m.from, service)
+					.iter()
+					.any(|c| c.state != CopyState::GaveUp)
+			{
+				off.insert(m.from.as_str(), Some(m.to.as_str()));
+			}
+		}
+		let prefer = off.values().find_map(|p| *p);
 		// Where its database is: a closed home (`serves_home`) takes this service's copies
 		// alone, and packing starts there (below).
 		let database = database_of(spec, facts, service);
@@ -164,8 +303,25 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 					&& h.dedicated_to == service.dedicated_to
 					&& service.placement.allows(h)
 					&& !gave_up.contains(h.name.as_str())
+					&& !off.contains_key(h.name.as_str())
 			})
 			.collect();
+		// The copies on a host they move off keep their room there until they go.
+		let mut holding: Vec<(&str, &str, u32)> = Vec::new();
+		for host in off.keys() {
+			let mut running: BTreeMap<&str, u32> = BTreeMap::new();
+			for c in copies.on(host, service) {
+				if c.state == CopyState::Running {
+					*running.entry(c.version.as_str()).or_default() += 1;
+				}
+			}
+			for (version, n) in running {
+				for _ in 0..n {
+					free.insert(host, free[host].minus(service.per_copy));
+				}
+				holding.push((host, version, n));
+			}
+		}
 		// How many copies one host may hold. One, for a service the agents run on one fixed host port
 		// (`compile.rs`: a lost host leaves its copy unplaced and noted, never doubled up on a
 		// survivor) and for one whose policy spreads (a lost host's copy waits for a host of its
@@ -269,7 +425,7 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 			}
 			kept_of.push(kept);
 		}
-		plans.push(ServicePlan {
+		plans.push_back(ServicePlan {
 			service,
 			id,
 			said,
@@ -280,6 +436,11 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 			pack,
 			moving_home,
 			chosen,
+			holding,
+			prefer,
+			preempted: BTreeSet::new(),
+			off: off.keys().copied().collect(),
+			gave_up,
 		});
 	}
 
@@ -287,7 +448,10 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 	// its copies name one set of hosts (otherwise auth and its router on different
 	// hosts would name more hosts than copies, which the control plane refuses).
 	let mut env_hosts: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-	for plan in plans {
+	// Environments that still hold a copy on a host they move off (a move not done yet).
+	let mut still_moving: BTreeSet<(&str, &str)> = BTreeSet::new();
+	let mut shortfalls: Vec<Shortfall> = Vec::new();
+	while let Some(plan) = plans.pop_front() {
 		let ServicePlan {
 			service,
 			id,
@@ -299,12 +463,20 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 			pack,
 			moving_home,
 			mut chosen,
+			holding,
+			prefer,
+			preempted,
+			gave_up,
+			off,
 		} = plan;
 		notes.extend(said);
+		// Never a new copy on a host under pressure.
 		let addable: Vec<&HostSpec> = eligible
 			.iter()
 			.copied()
-			.filter(|h| !report_only.contains(h.name.as_str()))
+			.filter(|h| {
+				!report_only.contains(h.name.as_str()) && !pressure.hosts.contains(h.name.as_str())
+			})
 			.collect();
 		let database = database_of(spec, facts, service);
 		// (host, version) of each copy this decision adds.
@@ -314,9 +486,17 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 			let mut placed = kept;
 			while placed < *target {
 				let with = env_hosts.get(service.environment.as_str());
-				let Some(host) =
-					best_host(&addable, &chosen, &free, service, database, cap, pack, with)
-				else {
+				let mut host = best_host(
+					&addable, &chosen, &free, service, database, cap, pack, with, prefer,
+				);
+				if host.is_none() && service.priority > 0 {
+					// No room: take a lower priority's (preemption), and say so.
+					host = preempt(
+						&addable, &chosen, &mut free, service, database, cap, &mut plans, &id,
+						&mut notes,
+					);
+				}
+				let Some(host) = host else {
 					break;
 				};
 				free.insert(host, free[host].minus(service.per_copy));
@@ -326,18 +506,40 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 				placed += 1;
 			}
 			if placed < *target {
-				notes.push(if eligible.is_empty() {
-					format!(
-						"{id}: wanted {target} copies of {version}, placed {placed}: no eligible host is reporting"
-					)
+				let refused = refusals(
+					spec,
+					service,
+					&Refusing {
+						alive: &alive,
+						report_only: &report_only,
+						pressured: &pressure.hosts,
+						gave_up: &gave_up,
+						off: &off,
+						preempted: &preempted,
+						database: database.host,
+						cap,
+					},
+					&chosen,
+					&free,
+				);
+				let why = if eligible.is_empty() {
+					"no eligible host is reporting"
 				} else if addable.is_empty() {
-					format!(
-						"{id}: wanted {target} copies of {version}, placed {placed}: every eligible host only reports"
-					)
+					"every eligible host only reports"
 				} else {
-					format!(
-						"{id}: wanted {target} copies of {version}, placed {placed}: no eligible host has room"
-					)
+					"no eligible host has room"
+				};
+				notes.push(format!(
+					"{id}: wanted {target} copies of {version}, placed {placed}: {why}{}",
+					refusal_summary(&refused, service.per_copy)
+				));
+				shortfalls.push(Shortfall {
+					service: id.clone(),
+					version: version.to_string(),
+					wanted: *target,
+					placed,
+					needs: service.per_copy,
+					hosts: refused,
 				});
 			}
 		}
@@ -349,6 +551,9 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 		// of its version all run steady (make before break, as a draining host's).
 		if let Some(home) = database.host {
 			for (host, version, n) in moving_home {
+				if preempted.contains(host) {
+					continue;
+				}
 				let at_home = chosen
 					.get(home)
 					.and_then(|v| v.get(version))
@@ -383,8 +588,13 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 		// A version change never takes a region's copies down in one decision (swapping both
 		// copies in a region at once leaves the far copy alone answering until they run). A running
 		// copy that a decision adding copies would retire, on a host that stays, goes only when
-		// nothing placed is still on its way up, and one host at a time; the rest keep their
-		// version, routed at the share of the version replacing it, until a later decision.
+		// nothing placed is still on its way up, and `max_unavailable` hosts at a time (one, without a
+		// rollout); the rest keep their version, routed at the share of the version replacing it,
+		// until a later decision. With a rollout, a copy that is only surplus (its replacement
+		// already elsewhere, the surge) goes the same way.
+		let rollout = service.rollout;
+		let max_unavailable = rollout.map_or(1, |r| r.max_unavailable) as usize;
+		let max_surge = rollout.map_or(0, |r| r.max_surge);
 		let running_of = |host: &str, version: &str| -> u32 {
 			copies
 				.on(host, service)
@@ -393,11 +603,11 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 				.count() as u32
 		};
 		let mut retiring: Vec<(&str, &str, u32)> = Vec::new();
-		if !added.is_empty() {
+		if !added.is_empty() || rollout.is_some() {
 			let mut hosts: Vec<&str> = eligible
 				.iter()
 				.map(|h| h.name.as_str())
-				.filter(|h| !report_only.contains(h))
+				.filter(|h| !report_only.contains(h) && !preempted.contains(h))
 				.collect();
 			hosts.sort();
 			for host in hosts {
@@ -421,16 +631,27 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 			}
 		}
 		let changing: BTreeSet<&str> = retiring.iter().map(|(h, _, _)| *h).collect();
-		let on_the_way = chosen.iter().any(|(host, versions)| {
-			!changing.contains(host)
-				&& versions
-					.iter()
-					.any(|(version, n)| running_of(host, version) < *n)
-		});
-		let mut let_go: Option<&str> = None;
+		let on_the_way = chosen
+			.iter()
+			.filter(|(host, versions)| {
+				!changing.contains(*host)
+					&& versions
+						.iter()
+						.any(|(version, n)| running_of(host, version) < *n)
+			})
+			.count();
+		let budget = if on_the_way > 0 {
+			max_unavailable.saturating_sub(on_the_way)
+		} else {
+			max_unavailable
+		};
+		let wanted: u32 = targets.iter().map(|(_, t)| *t).sum();
+		let mut let_go: BTreeSet<&str> = BTreeSet::new();
+		// Copies of the new version moved to a host holding none of the service (the surge).
+		let mut surged: Vec<(&str, &str)> = Vec::new();
 		for (host, old, gone) in retiring {
-			if !on_the_way && let_go.is_none_or(|h| h == host) {
-				let_go = Some(host);
+			if let_go.contains(host) || let_go.len() < budget {
+				let_go.insert(host);
 				continue;
 			}
 			let mut replacing = None;
@@ -458,9 +679,9 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 				free.insert(host, free[host].minus(service.per_copy));
 			}
 			*chosen.entry(host).or_default().entry(old).or_default() += gone;
+			let effective = &shares[&id];
 			let share_of = |version: &str| {
-				service
-					.versions
+				effective
 					.iter()
 					.find(|v| v.version == version)
 					.map_or(0, |v| v.share)
@@ -472,11 +693,36 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 			notes.push(format!(
 				"{id}: {host} keeps {old} until the copy changing before it runs"
 			));
+			// The surge: the copy that would have replaced it here goes to a host that holds none of
+			// the service, beside it, while the service stays within `max_surge` of its copies.
+			if let Some(version) = replacing {
+				let total: u32 = chosen.values().flat_map(|v| v.values()).sum();
+				if total < wanted + max_surge {
+					let fresh: Vec<&HostSpec> = addable
+						.iter()
+						.copied()
+						.filter(|h| on_host(&chosen, h.name.as_str()) == 0)
+						.collect();
+					let with = env_hosts.get(service.environment.as_str());
+					if let Some(to) = best_host(
+						&fresh, &chosen, &free, service, database, cap, pack, with, None,
+					) {
+						free.insert(to, free[to].minus(service.per_copy));
+						*chosen.entry(to).or_default().entry(version).or_default() += 1;
+						surged.push((to, version));
+					}
+				}
+			}
+		}
+		for (to, version) in surged {
+			notes.push(format!(
+				"{id}: a copy of {version} placed on {to}, beside the old ones (surge)"
+			));
 		}
 		// A draining host (packing) takes no copy, since it does not serve, and the copy it
 		// runs stays placed, and so routed, until the copies placed for the service elsewhere all run
-		// steady: make before break, so a move never takes a service below its copies.
-		let wanted: u32 = targets.iter().map(|(_, t)| *t).sum();
+		// steady: make before break, so a move never takes a service below its copies. A host a copy
+		// moves off for pressure or the rebalancer holds it the same way.
 		let steady_elsewhere: u32 = chosen
 			.iter()
 			.map(|(host, versions)| {
@@ -523,6 +769,20 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 				}
 			}
 		}
+		for (host, version, n) in holding {
+			if steady_elsewhere >= wanted {
+				for _ in 0..n {
+					free.insert(host, free[host].plus(service.per_copy));
+				}
+				notes.push(format!("{id}: {host}'s copy of {version} moved off it"));
+				continue;
+			}
+			*chosen.entry(host).or_default().entry(version).or_default() += n;
+			still_moving.insert((service.environment.as_str(), host));
+			notes.push(format!(
+				"{id}: {host} keeps its copy of {version} until the copies elsewhere run steady"
+			));
+		}
 		for (host, versions) in chosen {
 			for (version, count) in versions {
 				placement.push(Assignment {
@@ -537,13 +797,165 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 	}
 	placement.sort();
 
-	let table = routing_table(spec, facts, &alive, &placement, &held, &copies);
+	// A move in flight stays until no copy of its environment is held on `from`; then a new one may
+	// start, from this decision's placement, once everything runs steady.
+	let mut next_moves: Vec<Move> = moves
+		.iter()
+		.filter(|m| still_moving.contains(&(m.environment.as_str(), m.from.as_str())))
+		.cloned()
+		.collect();
+	if next_moves.is_empty()
+		&& let Some(band) = spec.rebalance
+		&& let Some((m, why)) = pick_move(
+			spec,
+			facts,
+			&alive,
+			&report_only,
+			&free,
+			&placement,
+			&copies,
+			&rollbacks,
+			band,
+		) {
+		notes.push(why);
+		next_moves.push(m);
+	}
+
+	let table = routing_table(spec, facts, &alive, &placement, &held, &copies, &shares);
 	Outcome {
 		placement,
 		table,
 		notes,
 		heard: alive.iter().map(|h| h.to_string()).collect(),
+		moves: next_moves,
+		rollbacks,
+		shortfalls,
 	}
+}
+
+/// What a decision knows about one service when it says why each host refused a copy.
+struct Refusing<'a, 'b> {
+	alive: &'b BTreeSet<&'a str>,
+	report_only: &'b BTreeSet<&'a str>,
+	pressured: &'b BTreeSet<&'a str>,
+	gave_up: &'b BTreeSet<&'a str>,
+	off: &'b BTreeSet<&'a str>,
+	preempted: &'b BTreeSet<&'a str>,
+	database: Option<&'a str>,
+	cap: u32,
+}
+
+/// Every host of the spec and why it took no more copies of `service`, in the order of
+/// [`Refused`]: the same tests, in the same order, as the two passes of [`decide`]. A host that
+/// would still take one (none, when `best_host` and `preempt` found nothing) is left out.
+fn refusals(
+	spec: &Spec,
+	service: &ServiceSpec,
+	why: &Refusing,
+	chosen: &BTreeMap<&str, BTreeMap<&str, u32>>,
+	free: &BTreeMap<&str, Resources>,
+) -> Vec<Refusal> {
+	spec.hosts
+		.iter()
+		.filter_map(|h| {
+			let name = h.name.as_str();
+			let on_database = why.database == Some(name);
+			let cap = if on_database { why.cap } else { 1 };
+			let left = free[name];
+			let reason = if !why.alive.contains(name) {
+				Refused::NotReporting
+			} else if h.dedicated_to != service.dedicated_to {
+				if h.dedicated_to.is_some() {
+					Refused::Dedicated
+				} else {
+					Refused::Shared
+				}
+			} else if !service.placement.allows(h) {
+				Refused::NotOnItsList
+			} else if !(h.serves || h.frozen || (h.serves_home && !h.draining && on_database)) {
+				if h.draining {
+					Refused::Draining
+				} else {
+					Refused::NotServing
+				}
+			} else if why.gave_up.contains(name) {
+				Refused::GaveUp
+			} else if why.off.contains(name) {
+				Refused::MovingOff
+			} else if h.frozen {
+				Refused::Frozen
+			} else if why.report_only.contains(name) {
+				Refused::OnlyReports
+			} else if why.pressured.contains(name) {
+				Refused::UnderPressure
+			} else if why.preempted.contains(name) {
+				Refused::Preempted
+			} else if on_host(chosen, name) >= cap {
+				Refused::HoldsItsShare
+			} else if !left.fits(service.per_copy) {
+				Refused::Full
+			} else {
+				return None;
+			};
+			Some(Refusal {
+				host: h.name.clone(),
+				reason,
+				dedicated_to: h.dedicated_to.clone().or_else(|| h.owner.clone()),
+				capacity: h.capacity,
+				free: left,
+				server: h.server,
+			})
+		})
+		.collect()
+}
+
+/// The refusals as a clause for the note, by reason: ` (2 full: h1 256 of 4096 MB free, h2 …; 1
+/// not on its list of hosts: h3)`. Five hosts named a reason, then how many more.
+fn refusal_summary(refused: &[Refusal], needs: Resources) -> String {
+	if refused.is_empty() {
+		return String::new();
+	}
+	let mut by: BTreeMap<Refused, Vec<&Refusal>> = BTreeMap::new();
+	for r in refused {
+		by.entry(r.reason).or_default().push(r);
+	}
+	let parts: Vec<String> = by
+		.iter()
+		.map(|(reason, hosts)| {
+			let mut named: Vec<String> = hosts
+				.iter()
+				.take(5)
+				.map(|r| match r.reason {
+					Refused::Full if r.free.memory_mb < needs.memory_mb => match r.server {
+						Some(server) if server.memory_mb > r.capacity.memory_mb => format!(
+							"{} {} of {} MB free, of a {} MB server",
+							r.host, r.free.memory_mb, r.capacity.memory_mb, server.memory_mb
+						),
+						_ => format!(
+							"{} {} of {} MB free",
+							r.host, r.free.memory_mb, r.capacity.memory_mb
+						),
+					},
+					Refused::Full => format!(
+						"{} {} of {} millicpu free",
+						r.host, r.free.millicpu, r.capacity.millicpu
+					),
+					// Whose it is matters where that is the reason; a host off the service's list is
+					// someone's pool or another region, and its owner would only be noise.
+					Refused::Dedicated => match &r.dedicated_to {
+						Some(owner) => format!("{} ({owner})", r.host),
+						None => r.host.clone(),
+					},
+					_ => r.host.clone(),
+				})
+				.collect();
+			if hosts.len() > 5 {
+				named.push(format!("{} more", hosts.len() - 5));
+			}
+			format!("{} {}: {}", hosts.len(), reason.words(), named.join(", "))
+		})
+		.collect();
+	format!(" ({})", parts.join("; "))
 }
 
 /// One service between the two passes of [`decide`]: what it wants, and the copies it keeps.
@@ -562,6 +974,568 @@ struct ServicePlan<'a> {
 	/// Copies kept off the home only until the home's copies run steady.
 	moving_home: Vec<(&'a str, &'a str, u32)>,
 	chosen: BTreeMap<&'a str, BTreeMap<&'a str, u32>>,
+	/// (host, version, copies) running on a host it moves off (pressure, the rebalancer): kept there,
+	/// their room held, until the copies elsewhere run steady.
+	holding: Vec<(&'a str, &'a str, u32)>,
+	/// The host its new copies go to first: the rebalancer's `to`.
+	prefer: Option<&'a str>,
+	/// Hosts a higher priority took its copies' room on: nothing of it is kept or added there.
+	preempted: BTreeSet<&'a str>,
+	/// Hosts whose agent gave up on it, and hosts it moves off: kept to say why a host refused.
+	gave_up: BTreeSet<&'a str>,
+	off: BTreeSet<&'a str>,
+}
+
+/// The versions a service is placed and routed at: the spec's, with a rolled-back version's share
+/// given to the version it rolled back to.
+fn effective_versions(service: &ServiceSpec, rollback: Option<&Rollback>) -> Vec<VersionShare> {
+	let Some(rollback) = rollback else {
+		return service.versions.clone();
+	};
+	let moved: u32 = service
+		.versions
+		.iter()
+		.filter(|v| v.version == rollback.from)
+		.map(|v| v.share)
+		.sum();
+	let mut out: Vec<VersionShare> = service
+		.versions
+		.iter()
+		.filter(|v| v.version != rollback.from)
+		.cloned()
+		.collect();
+	match out.iter_mut().find(|v| v.version == rollback.to) {
+		Some(v) => v.share += moved,
+		None => out.push(VersionShare {
+			version: rollback.to.clone(),
+			share: moved,
+		}),
+	}
+	out
+}
+
+/// The rollbacks in force: the last decision's (`Facts::rollbacks`) while the service still rolls
+/// back and its spec still names the version that gave up with a share, and a new one when an agent
+/// gave up on a copy of a version with a share while another version still runs (the most running
+/// copies, then by name). A spec that changes the version ends it.
+fn rollbacks(
+	spec: &Spec,
+	facts: &Facts,
+	alive: &BTreeSet<&str>,
+	copies: &CopyIndex,
+	notes: &mut Vec<String>,
+) -> BTreeMap<String, Rollback> {
+	let mut out = BTreeMap::new();
+	for service in &spec.services {
+		if !service.rollout.is_some_and(|r| r.rollback) {
+			continue;
+		}
+		let id = service.id();
+		let named = |version: &str| {
+			service
+				.versions
+				.iter()
+				.any(|v| v.version == version && v.share > 0)
+		};
+		if let Some(last) = facts.rollbacks.get(&id)
+			&& named(&last.from)
+		{
+			out.insert(id, last.clone());
+			continue;
+		}
+		let on_alive: Vec<&CopyFacts> = copies
+			.hosts_of(service)
+			.iter()
+			.filter(|(h, _)| alive.contains(h))
+			.map(|(_, c)| *c)
+			.collect();
+		let failed = service.versions.iter().find(|v| {
+			v.share > 0
+				&& on_alive
+					.iter()
+					.any(|c| c.version == v.version && c.state == CopyState::GaveUp)
+		});
+		let Some(failed) = failed else {
+			continue;
+		};
+		// Only back to an older version: one the spec no longer gives a share, or one it lists before
+		// the one that gave up (a canary lists the stable version first). A stable copy giving up beside
+		// a canary is a copy given up, never a reason to roll forward.
+		let at = |version: &str| service.versions.iter().position(|v| v.version == version);
+		let older = |version: &str| match (at(version), at(&failed.version)) {
+			(Some(i), Some(f)) => !named(version) || i < f,
+			_ => true,
+		};
+		let mut running: BTreeMap<&str, u32> = BTreeMap::new();
+		for c in &on_alive {
+			if c.state == CopyState::Running && c.version != failed.version && older(&c.version) {
+				*running.entry(c.version.as_str()).or_default() += 1;
+			}
+		}
+		let back = running
+			.iter()
+			.max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+			.map(|(v, _)| v.to_string());
+		if let Some(to) = back {
+			notes.push(format!(
+				"{id}: an agent gave up on {}; rolled back to {to} until the spec changes its version",
+				failed.version
+			));
+			out.insert(
+				id,
+				Rollback {
+					from: failed.version.clone(),
+					to,
+				},
+			);
+		}
+	}
+	out
+}
+
+/// What pressure sheds: the hosts under it, and by host the service ids moved off it.
+struct Pressure<'a> {
+	hosts: BTreeSet<&'a str>,
+	shed: BTreeMap<&'a str, BTreeSet<String>>,
+}
+
+/// Hosts whose running copies use more than `pressure_percent` of their capacity (CPU or memory, a
+/// dimension with no capacity left out), and on each, the services moved off it until what stays fits:
+/// best effort first, then burstable by how far past its request it runs, the lowest priority first
+/// within a class, never a guaranteed or one-clock copy. A host that only reports, frozen or draining
+/// is left as it is.
+fn pressure<'a>(
+	spec: &'a Spec,
+	facts: &'a Facts,
+	alive: &BTreeSet<&str>,
+	report_only: &BTreeSet<&str>,
+	notes: &mut Vec<String>,
+) -> Pressure<'a> {
+	let mut out = Pressure {
+		hosts: BTreeSet::new(),
+		shed: BTreeMap::new(),
+	};
+	let Some(percent) = spec.pressure_percent else {
+		return out;
+	};
+	let of = |n: u32| (u64::from(n) * u64::from(percent) / 100) as u32;
+	for host in &spec.hosts {
+		let name = host.name.as_str();
+		if !alive.contains(name) || report_only.contains(name) || host.draining {
+			continue;
+		}
+		let Some(reported) = facts.hosts.iter().find(|h| h.name == host.name) else {
+			continue;
+		};
+		let limit = Resources {
+			millicpu: of(host.capacity.millicpu),
+			memory_mb: of(host.capacity.memory_mb),
+		};
+		// (service, its copies' use here) for each spec service running here.
+		let mut by_service: BTreeMap<String, (&ServiceSpec, Resources)> = BTreeMap::new();
+		let mut used = Resources::default();
+		for c in &reported.copies {
+			let (Some(load), CopyState::Running) = (c.load, c.state) else {
+				continue;
+			};
+			used = used.plus(load);
+			if let Some(s) = spec
+				.services
+				.iter()
+				.find(|s| s.environment == c.environment && s.name == c.service)
+			{
+				let entry = by_service
+					.entry(s.id())
+					.or_insert((s, Resources::default()));
+				entry.1 = entry.1.plus(load);
+			}
+		}
+		let over = |used: Resources| {
+			(host.capacity.millicpu > 0 && used.millicpu > limit.millicpu)
+				|| (host.capacity.memory_mb > 0 && used.memory_mb > limit.memory_mb)
+		};
+		if !over(used) {
+			continue;
+		}
+		out.hosts.insert(name);
+		let mut candidates: Vec<(String, &ServiceSpec, Resources)> = by_service
+			.into_iter()
+			.filter(|(_, (s, _))| s.qos() != Qos::Guaranteed && !s.one_clock)
+			.map(|(id, (s, load))| (id, s, load))
+			.collect();
+		let past = |s: &ServiceSpec, load: Resources| {
+			(
+				load.memory_mb.saturating_sub(s.per_copy.memory_mb),
+				load.millicpu.saturating_sub(s.per_copy.millicpu),
+			)
+		};
+		candidates.sort_by(|a, b| {
+			a.1.qos()
+				.cmp(&b.1.qos())
+				.then(a.1.priority.cmp(&b.1.priority))
+				.then(past(b.1, b.2).cmp(&past(a.1, a.2)))
+				.then(a.0.cmp(&b.0))
+		});
+		let mut left = used;
+		let mut shed = BTreeSet::new();
+		for (id, s, load) in candidates {
+			if !over(left) {
+				break;
+			}
+			left = left.minus(load);
+			notes.push(format!(
+				"{name}: its copies use more than {percent}% of what it has; {id} ({}) moves off it",
+				match s.qos() {
+					Qos::BestEffort => "best effort",
+					Qos::Burstable => "burstable",
+					Qos::Guaranteed => "guaranteed",
+				}
+			));
+			shed.insert(id);
+		}
+		if over(left) {
+			notes.push(format!(
+				"{name}: still past {percent}% with only guaranteed copies left; nothing more moves"
+			));
+		}
+		if !shed.is_empty() {
+			out.shed.insert(name, shed);
+		}
+	}
+	out
+}
+
+/// The last decision's move, while the spec still rebalances and both hosts can take part: `from`
+/// heard, `to` heard, serving and not held.
+fn live_moves<'a>(
+	spec: &'a Spec,
+	alive: &BTreeSet<&str>,
+	report_only: &BTreeSet<&str>,
+	facts: &'a Facts,
+	notes: &mut Vec<String>,
+) -> Vec<Move> {
+	if spec.rebalance.is_none() {
+		return Vec::new();
+	}
+	let mut out = Vec::new();
+	for m in &facts.moves {
+		let to = spec.hosts.iter().find(|h| h.name == m.to);
+		let ok = alive.contains(m.from.as_str())
+			&& alive.contains(m.to.as_str())
+			&& !report_only.contains(m.from.as_str())
+			&& to.is_some_and(|h| h.serves && !h.draining && !report_only.contains(m.to.as_str()));
+		if ok {
+			out.push(m.clone());
+		} else {
+			notes.push(format!(
+				"rebalance: {}'s move from {} to {} is no longer possible; given up",
+				m.environment, m.from, m.to
+			));
+		}
+	}
+	out
+}
+
+/// A host preemption can free: (highest victim priority, victims, host, [(plan index, version,
+/// copies)]).
+type Freed<'a> = (u32, usize, &'a str, Vec<(usize, &'a str, u32)>);
+
+/// Takes room for `service` on one host from lower priorities' copies kept there, the fewest and
+/// lowest first: their copies on that host go (they are placed elsewhere in their own turn if
+/// anywhere has room), and the host is returned. None when no host can be freed that way.
+#[allow(clippy::too_many_arguments)]
+fn preempt<'a>(
+	addable: &[&'a HostSpec],
+	chosen: &BTreeMap<&'a str, BTreeMap<&'a str, u32>>,
+	free: &mut BTreeMap<&'a str, Resources>,
+	service: &ServiceSpec,
+	database: Database,
+	cap: u32,
+	plans: &mut VecDeque<ServicePlan<'a>>,
+	id: &str,
+	notes: &mut Vec<String>,
+) -> Option<&'a str> {
+	// (highest victim priority, victims, host, [(plan index, version, copies)])
+	let mut best: Option<Freed<'a>> = None;
+	for host in addable {
+		let name = host.name.as_str();
+		let cap_here = if database.host == Some(name) { cap } else { 1 };
+		if on_host(chosen, name) >= cap_here {
+			continue;
+		}
+		let mut victims: Vec<(u32, String, usize, &'a str, u32)> = Vec::new();
+		for (i, plan) in plans.iter().enumerate() {
+			if plan.service.priority >= service.priority {
+				continue;
+			}
+			if let Some(versions) = plan.chosen.get(name) {
+				for (version, n) in versions {
+					victims.push((plan.service.priority, plan.id.clone(), i, version, *n));
+				}
+			}
+		}
+		victims.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.3.cmp(b.3)));
+		let mut room = free[name];
+		let mut taken = Vec::new();
+		let mut top = 0;
+		for (priority, _, i, version, n) in victims {
+			if room.fits(service.per_copy) {
+				break;
+			}
+			let per = plans[i].service.per_copy;
+			for _ in 0..n {
+				room = room.plus(per);
+			}
+			top = top.max(priority);
+			taken.push((i, version, n));
+		}
+		if taken.is_empty() || !room.fits(service.per_copy) {
+			continue;
+		}
+		let better = best
+			.as_ref()
+			.is_none_or(|(p, k, h, _)| (top, taken.len(), name) < (*p, *k, *h));
+		if better {
+			best = Some((top, taken.len(), name, taken));
+		}
+	}
+	let (_, _, host, taken) = best?;
+	for (i, version, n) in taken {
+		let plan = &mut plans[i];
+		if let Some(versions) = plan.chosen.get_mut(host) {
+			versions.remove(version);
+			if versions.is_empty() {
+				plan.chosen.remove(host);
+			}
+		}
+		if let Some(k) = plan.targets.iter().position(|(v, _)| *v == version) {
+			plan.kept[k] = plan.kept[k].saturating_sub(n);
+		}
+		plan.eligible.retain(|h| h.name != host);
+		plan.moving_home.retain(|(h, _, _)| *h != host);
+		plan.preempted.insert(host);
+		for _ in 0..n {
+			free.insert(host, free[host].plus(plan.service.per_copy));
+		}
+		notes.push(format!(
+			"{}: its copy of {version} on {host} gives way to {id} (priority {} over {})",
+			plan.id, service.priority, plan.service.priority
+		));
+	}
+	Some(host)
+}
+
+/// A host's share of its capacity that its placed copies reserve, in percent: the busier of CPU and
+/// memory, a dimension it has none of left out.
+fn reserved_percent(capacity: Resources, free: Resources) -> u64 {
+	let of = |cap: u32, left: u32| {
+		if cap == 0 {
+			0
+		} else {
+			u64::from(cap.saturating_sub(left)) * 100 / u64::from(cap)
+		}
+	};
+	of(capacity.millicpu, free.millicpu).max(of(capacity.memory_mb, free.memory_mb))
+}
+
+/// The rebalancer's next move, once every placed copy runs steady and nothing else moves: an
+/// environment's copies on the most reserved host past `high_percent` go to the least reserved one
+/// under `low_percent` that can take all of them (every service's own rules, one copy of each per
+/// host, a fault domain no fuller than the one they leave, never the environment's database host),
+/// and only when it leaves both hosts below where `from` was. One environment per decision.
+#[allow(clippy::too_many_arguments)]
+fn pick_move(
+	spec: &Spec,
+	facts: &Facts,
+	alive: &BTreeSet<&str>,
+	report_only: &BTreeSet<&str>,
+	free: &BTreeMap<&str, Resources>,
+	placement: &[Assignment],
+	copies: &CopyIndex,
+	rollbacks: &BTreeMap<String, Rollback>,
+	band: Rebalance,
+) -> Option<(Move, String)> {
+	// Calm: every placed copy runs steady, and nothing runs that is not placed.
+	let steady = |host: &str, env: &str, name: &str, version: &str| -> u32 {
+		copies
+			.by_host
+			.get(host)
+			.and_then(|e| e.get(env))
+			.and_then(|s| s.get(name))
+			.map_or(0, |cs| {
+				cs.iter()
+					.filter(|c| {
+						c.version == version
+							&& c.state == CopyState::Running
+							&& c.running_since_ms
+								.is_some_and(|s| facts.now_ms.saturating_sub(s) >= STEADY_MS)
+					})
+					.count() as u32
+			})
+	};
+	for a in placement {
+		if steady(&a.host, &a.environment, &a.service, &a.version) < a.count {
+			return None;
+		}
+	}
+	for host in facts
+		.hosts
+		.iter()
+		.filter(|h| alive.contains(h.name.as_str()))
+	{
+		for c in &host.copies {
+			let placed = placement.iter().any(|a| {
+				a.host == host.name
+					&& a.environment == c.environment
+					&& a.service == c.service
+					&& a.version == c.version
+			});
+			let known = spec
+				.services
+				.iter()
+				.any(|s| s.environment == c.environment && s.name == c.service);
+			if c.state == CopyState::Starting || (known && !placed) {
+				return None;
+			}
+		}
+	}
+	if spec
+		.hosts
+		.iter()
+		.any(|h| (h.draining || h.finishing) && alive.contains(h.name.as_str()))
+		|| !rollbacks.is_empty()
+	{
+		return None;
+	}
+	let open: Vec<&HostSpec> =
+		spec.hosts
+			.iter()
+			.filter(|h| {
+				h.serves
+					&& !h.draining && alive.contains(h.name.as_str())
+					&& !report_only.contains(h.name.as_str())
+			})
+			.collect();
+	let percent = |h: &HostSpec| reserved_percent(h.capacity, free[h.name.as_str()]);
+	let mut busy: Vec<&HostSpec> = open
+		.iter()
+		.copied()
+		.filter(|h| percent(h) > u64::from(band.high_percent))
+		.collect();
+	busy.sort_by(|a, b| percent(b).cmp(&percent(a)).then(a.name.cmp(&b.name)));
+	let mut quiet: Vec<&HostSpec> = open
+		.iter()
+		.copied()
+		.filter(|h| percent(h) < u64::from(band.low_percent))
+		.collect();
+	quiet.sort_by(|a, b| percent(a).cmp(&percent(b)).then(a.name.cmp(&b.name)));
+	let service_of = |env: &str, name: &str| {
+		spec.services
+			.iter()
+			.find(|s| s.environment == env && s.name == name)
+	};
+	for from in &busy {
+		let mut envs: BTreeMap<&str, Vec<&Assignment>> = BTreeMap::new();
+		for a in placement.iter().filter(|a| a.host == from.name) {
+			envs.entry(a.environment.as_str()).or_default().push(a);
+		}
+		// (resulting worst percent, `to` after, environment, to)
+		let mut best: Option<(u64, u64, &str, &HostSpec)> = None;
+		for (env, here) in &envs {
+			let services: Option<Vec<&ServiceSpec>> =
+				here.iter().map(|a| service_of(env, &a.service)).collect();
+			let Some(services) = services else {
+				continue;
+			};
+			if services.iter().any(|s| {
+				s.one_clock
+					|| s.policy.mode == PlaceMode::Pack
+					|| shares_versions(s, placement)
+					|| rollbacks.contains_key(&s.id())
+			}) {
+				continue;
+			}
+			let mut need = Resources::default();
+			for (a, s) in here.iter().zip(&services) {
+				for _ in 0..a.count {
+					need = need.plus(s.per_copy);
+				}
+			}
+			let env_hosts: BTreeSet<&str> = placement
+				.iter()
+				.filter(|a| a.environment == *env)
+				.map(|a| a.host.as_str())
+				.collect();
+			let domain_count = |domain: &str| {
+				env_hosts
+					.iter()
+					.filter(|h| **h != from.name)
+					.filter_map(|h| spec.hosts.iter().find(|s| s.name == *h))
+					.filter(|h| h.fault_domain == domain)
+					.count()
+			};
+			let database = facts.database_hosts.get(*env).map(String::as_str);
+			for to in &quiet {
+				let ok = to.name != from.name
+					&& !env_hosts.contains(to.name.as_str())
+					&& database != Some(to.name.as_str())
+					&& to.dedicated_to == from.dedicated_to
+					&& domain_count(&to.fault_domain) <= domain_count(&from.fault_domain)
+					&& free[to.name.as_str()].fits(need)
+					&& services.iter().all(|s| {
+						s.dedicated_to == to.dedicated_to
+							&& s.placement.allows(to)
+							&& !copies
+								.on(to.name.as_str(), s)
+								.iter()
+								.any(|c| c.state == CopyState::GaveUp)
+					});
+				if !ok {
+					continue;
+				}
+				let after_from =
+					reserved_percent(from.capacity, free[from.name.as_str()].plus(need));
+				let after_to = reserved_percent(to.capacity, free[to.name.as_str()].minus(need));
+				let worst = after_from.max(after_to);
+				if worst >= percent(from) {
+					continue;
+				}
+				if best.is_none_or(|(w, a, e, t)| {
+					(worst, after_to, *env, &to.name) < (w, a, e, &t.name)
+				}) {
+					best = Some((worst, after_to, env, to));
+				}
+			}
+		}
+		if let Some((_, _, env, to)) = best {
+			let why = format!(
+				"rebalance: {env}'s copies on {} ({}% reserved) move to {} ({}%)",
+				from.name,
+				percent(from),
+				to.name,
+				percent(to)
+			);
+			return Some((
+				Move {
+					environment: env.to_string(),
+					from: from.name.clone(),
+					to: to.name.clone(),
+				},
+				why,
+			));
+		}
+	}
+	None
+}
+
+/// The placement holds more than one version of the service (a roll in progress).
+fn shares_versions(service: &ServiceSpec, placement: &[Assignment]) -> bool {
+	let versions: BTreeSet<&str> = placement
+		.iter()
+		.filter(|a| a.environment == service.environment && a.service == service.name)
+		.map(|a| a.version.as_str())
+		.collect();
+	versions.len() > 1
 }
 
 /// The reported copies by host and service, built once per decision: at fleet size a decision
@@ -730,9 +1704,9 @@ fn busy_percent(used: Resources, per_copy: Resources, n: u32) -> u64 {
 
 /// The copies split by share, largest remainder first, ties to the version listed first. A version
 /// with a share gets at least one copy when there are copies enough for every such version.
-fn version_targets(service: &ServiceSpec, copies: u32) -> Vec<(&str, u32)> {
-	let total: u32 = service.versions.iter().map(|v| v.share).sum();
-	let shared: Vec<_> = service.versions.iter().filter(|v| v.share > 0).collect();
+fn version_targets(versions: &[VersionShare], copies: u32) -> Vec<(&str, u32)> {
+	let total: u32 = versions.iter().map(|v| v.share).sum();
+	let shared: Vec<_> = versions.iter().filter(|v| v.share > 0).collect();
 	let mut out: Vec<(&str, u32, u64)> = shared
 		.iter()
 		.map(|v| {
@@ -789,6 +1763,7 @@ fn best_host<'a>(
 	cap: u32,
 	pack: bool,
 	with: Option<&BTreeSet<&'a str>>,
+	prefer: Option<&str>,
 ) -> Option<&'a str> {
 	// A host the project's earlier services hold.
 	let shared = |host: &HostSpec| with.is_some_and(|w| w.contains(host.name.as_str()));
@@ -815,7 +1790,9 @@ fn best_host<'a>(
 			} else {
 				std::cmp::Ordering::Equal
 			};
+			let preferred = |h: &HostSpec| prefer == Some(h.name.as_str());
 			packed
+				.then(preferred(b).cmp(&preferred(a)))
 				.then(shared(b).cmp(&shared(a)))
 				.then(on(&a.name).cmp(&on(&b.name)))
 				.then(in_domain(&a.fault_domain).cmp(&in_domain(&b.fault_domain)))
@@ -849,6 +1826,7 @@ fn routing_table(
 	placement: &[Assignment],
 	held: &BTreeMap<(String, String, String), u32>,
 	copies: &CopyIndex,
+	shares: &BTreeMap<String, Vec<VersionShare>>,
 ) -> BTreeMap<String, Vec<Route>> {
 	let placed_at: BTreeMap<(&str, &str, &str, &str), u32> = placement
 		.iter()
@@ -882,8 +1860,7 @@ fn routing_table(
 			// Every live host reported (that is what makes it live).
 			let here = copies.on(host.name.as_str(), service);
 			// The spec's versions, and an old one this host keeps through a roll at its held share.
-			let mut versions: BTreeMap<&str, u32> = service
-				.versions
+			let mut versions: BTreeMap<&str, u32> = shares[&id]
 				.iter()
 				.map(|v| (v.version.as_str(), v.share))
 				.collect();
@@ -958,6 +1935,8 @@ mod tests {
 			frozen: false,
 			finishing: false,
 			dedicated_to: None,
+			server: None,
+			owner: None,
 			capacity: Resources {
 				millicpu: 2000,
 				memory_mb: 4096,
@@ -988,6 +1967,9 @@ mod tests {
 			routed: true,
 			scale: None,
 			policy: Default::default(),
+			limit: None,
+			priority: 0,
+			rollout: None,
 		}
 	}
 
@@ -1035,6 +2017,8 @@ mod tests {
 			services,
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		}
 	}
 
@@ -1071,6 +2055,8 @@ mod tests {
 				.collect(),
 			database_primary_region: Some("region-c".into()),
 			database_hosts: Default::default(),
+			moves: Vec::new(),
+			rollbacks: Default::default(),
 		}
 	}
 
@@ -1087,6 +2073,8 @@ mod tests {
 			],
 			database_primary_region: None,
 			database_hosts: Default::default(),
+			moves: Vec::new(),
+			rollbacks: Default::default(),
 		};
 		let outcome = decide(&spec, &facts);
 		assert_eq!(outcome.heard, ["home-1", "remote-1"]);
@@ -1383,18 +2371,24 @@ mod tests {
 	fn versions_split_by_share() {
 		let s = service("functions", 10, &[("0.2.1", 9), ("0.2.2", 1)]);
 		assert_eq!(
-			version_targets(&s, s.copies),
+			version_targets(&s.versions, s.copies),
 			vec![("0.2.1", 9), ("0.2.2", 1)]
 		);
 		let small = service("functions", 2, &[("0.2.1", 99), ("0.2.2", 1)]);
 		assert_eq!(
-			version_targets(&small, small.copies),
+			version_targets(&small.versions, small.copies),
 			vec![("0.2.1", 1), ("0.2.2", 1)]
 		);
 		let one = service("functions", 1, &[("0.2.1", 9), ("0.2.2", 1)]);
-		assert_eq!(version_targets(&one, one.copies), vec![("0.2.1", 1)]);
+		assert_eq!(
+			version_targets(&one.versions, one.copies),
+			vec![("0.2.1", 1)]
+		);
 		let off = service("functions", 3, &[("0.2.1", 1), ("0.2.0", 0)]);
-		assert_eq!(version_targets(&off, off.copies), vec![("0.2.1", 3)]);
+		assert_eq!(
+			version_targets(&off.versions, off.copies),
+			vec![("0.2.1", 3)]
+		);
 	}
 
 	#[test]
@@ -1439,12 +2433,16 @@ mod tests {
 			services: vec![theirs, ours],
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		};
 		let facts = Facts {
 			now_ms: NOW,
 			hosts: vec![alive("pod-shared", vec![]), alive("pod-big1", vec![])],
 			database_primary_region: None,
 			database_hosts: Default::default(),
+			moves: Vec::new(),
+			rollbacks: Default::default(),
 		};
 		let outcome = decide(&spec, &facts);
 		// One per host (spread): each side places what its one host may hold, never on the other's.
@@ -1971,6 +2969,8 @@ mod tests {
 			services: vec![service("auth", copies, &[("0.1.11", 1)])],
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		};
 		let running = || copy("auth", "0.1.11", CopyState::Running);
 		let facts = Facts {
@@ -1982,6 +2982,8 @@ mod tests {
 			],
 			database_primary_region: None,
 			database_hosts: Default::default(),
+			moves: Vec::new(),
+			rollbacks: Default::default(),
 		};
 		let kept = decide(&spec(2), &facts);
 		assert_eq!(
@@ -2049,6 +3051,8 @@ mod tests {
 			services: vec![service("auth", 2, &[("0.1.11", 1)])],
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		};
 		let since = |state: CopyState, ms: Option<u64>| CopyFacts {
 			running_since_ms: ms,
@@ -2064,6 +3068,8 @@ mod tests {
 			],
 			database_primary_region: None,
 			database_hosts: Default::default(),
+			moves: Vec::new(),
+			rollbacks: Default::default(),
 		};
 		let at = |o: &Outcome| {
 			(
@@ -2120,6 +3126,8 @@ mod tests {
 			services: vec![service("auth", 2, &[("0.1.11", 1)])],
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		};
 		let since = |state: CopyState, ms: Option<u64>| CopyFacts {
 			running_since_ms: ms,
@@ -2134,6 +3142,8 @@ mod tests {
 			],
 			database_primary_region: None,
 			database_hosts: Default::default(),
+			moves: Vec::new(),
+			rollbacks: Default::default(),
 		};
 		let total = |o: &Outcome| o.placement.iter().map(|a| a.count).sum::<u32>();
 
@@ -2202,6 +3212,8 @@ mod tests {
 			],
 			database_primary_region: None,
 			database_hosts: Default::default(),
+			moves: Vec::new(),
+			rollbacks: Default::default(),
 		};
 		assert_eq!(on(&decide(&spec, &empty), "h2", "auth"), 0);
 	}
@@ -2220,6 +3232,8 @@ mod tests {
 			services: vec![of("aaa", "auth", 1), of("bbb", "auth", 1)],
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		};
 		let facts = Facts {
 			now_ms: NOW,
@@ -2241,7 +3255,7 @@ mod tests {
 			}]
 		);
 		assert!(outcome.notes.iter().any(
-			|n| n.starts_with("aaa/auth: wanted 1") && n.ends_with("no eligible host has room")
+			|n| n.starts_with("aaa/auth: wanted 1") && n.contains("no eligible host has room")
 		));
 	}
 
@@ -2257,6 +3271,8 @@ mod tests {
 			services: vec![of("proja", "auth", 2), of("projb", "auth", 2)],
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		};
 		let mut facts = Facts {
 			now_ms: NOW,
@@ -2415,6 +3431,8 @@ mod tests {
 			services,
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		}
 	}
 
@@ -2547,6 +3565,8 @@ mod tests {
 			services: vec![of("proja", "auth", 2), of("projb", "auth", 2)],
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		};
 		let both = vec![running_of("proja", "auth"), running_of("projb", "auth")];
 		let mut facts = Facts {
@@ -2616,6 +3636,8 @@ mod tests {
 			services,
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		};
 		spec.check().expect("the fleet spec is one");
 		let empty = Facts {

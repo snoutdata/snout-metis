@@ -91,12 +91,26 @@ pub async fn tick(member: &Member) -> bool {
 			.iter()
 			.map(|(project, p)| (project.clone(), p.host.clone()))
 			.collect(),
+		// What the last decision carried on: the rebalancer's move in flight and the rollbacks.
+		moves: replicated
+			.decision
+			.as_ref()
+			.map(|d| d.outcome.moves.clone())
+			.unwrap_or_default(),
+		rollbacks: replicated
+			.decision
+			.as_ref()
+			.map(|d| d.outcome.rollbacks.clone())
+			.unwrap_or_default(),
 	};
 	let outcome = decide(&spec, &facts);
 	if replicated.decision.as_ref().is_some_and(|d| {
 		d.outcome.placement == outcome.placement
 			&& d.outcome.table == outcome.table
 			&& d.outcome.heard == outcome.heard
+			&& d.outcome.moves == outcome.moves
+			&& d.outcome.rollbacks == outcome.rollbacks
+			&& d.outcome.shortfalls == outcome.shortfalls
 			&& d.database == primary
 			&& d.projects == projects
 	}) {

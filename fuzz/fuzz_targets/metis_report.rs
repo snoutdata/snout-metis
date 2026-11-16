@@ -35,6 +35,7 @@ libfuzzer_sys::fuzz_target!(|data: &[u8]| {
 				}],
 				database_primary_region: None,
 				database_hosts: BTreeMap::new(),
+				..Default::default()
 			};
 			let _ = decide(&spec, &facts);
 		}

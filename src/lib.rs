@@ -14,6 +14,10 @@ pub mod compile;
 pub mod database;
 pub mod decide;
 pub mod member;
+#[cfg(test)]
+mod orchestration_tests;
+#[cfg(test)]
+mod shortfall_tests;
 pub mod replay;
 pub mod spec;
 

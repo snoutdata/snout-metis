@@ -94,11 +94,15 @@ mod tests {
 				frozen: false,
 				finishing: false,
 				dedicated_to: None,
+				server: None,
+				owner: None,
 				capacity: Resources::default(),
 			}],
 			services: vec![],
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		}
 	}
 

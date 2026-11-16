@@ -109,6 +109,8 @@ mod tests {
 			frozen: false,
 			finishing: false,
 			dedicated_to: None,
+			server: None,
+			owner: None,
 			capacity: Resources {
 				millicpu: 0,
 				memory_mb: 4096,
@@ -136,9 +138,14 @@ mod tests {
 				routed: true,
 				scale: None,
 				policy: Default::default(),
+				limit: None,
+				priority: 0,
+				rollout: None,
 			}],
 			database_cluster: None,
 			agents: Vec::new(),
+			pressure_percent: None,
+			rebalance: None,
 		}
 	}
 
