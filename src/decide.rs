@@ -129,6 +129,9 @@ pub struct Refusal {
 	/// The whole server, when the spec says (`HostSpec::server`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub server: Option<Resources>,
+	/// Which measure its capacity came from when not the reservations (`HostSpec::room`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub room: Option<String>,
 }
 
 /// Why a host took no more copies of a service. The first that applies, in this order.
@@ -293,6 +296,7 @@ mod tests {
 			dedicated_to: None,
 			server: None,
 			owner: None,
+			room: None,
 			capacity: Resources {
 				millicpu: 2000,
 				memory_mb: 4096,

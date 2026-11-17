@@ -277,6 +277,7 @@ mod tests {
 			dedicated_to: None,
 			server: None,
 			owner: None,
+			room: None,
 			capacity: Resources {
 				millicpu: 2000,
 				memory_mb: 2048,

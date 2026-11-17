@@ -35,6 +35,7 @@ fn spec() -> Spec {
 		},
 		server: None,
 		owner: None,
+		room: None,
 	};
 	Spec {
 		host_timeout_secs: 1,

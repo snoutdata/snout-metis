@@ -31,6 +31,7 @@ pub(crate) fn host(name: &str, domain: &str, memory_mb: u32) -> HostSpec {
 		dedicated_to: None,
 		server: None,
 		owner: None,
+		room: None,
 		capacity: mb(memory_mb),
 	}
 }

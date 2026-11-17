@@ -96,6 +96,7 @@ mod tests {
 				dedicated_to: None,
 				server: None,
 				owner: None,
+				room: None,
 				capacity: Resources::default(),
 			}],
 			services: vec![],

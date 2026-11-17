@@ -156,6 +156,11 @@ pub struct HostSpec {
 	/// fleet's pools, sql/337): only said, never placed by.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub owner: Option<String>,
+	/// Which measure `capacity` came from when it is not the reservations: `measured` for a server of
+	/// a pool the control plane measures (sql/396, a recommender beside Metis as Kubernetes' VPA).
+	/// Only said (a shortfall names it), never placed by: placing reads `capacity` alone.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub room: Option<String>,
 }
 
 fn serves_by_default() -> bool {

@@ -111,6 +111,7 @@ mod tests {
 			dedicated_to: None,
 			server: None,
 			owner: None,
+			room: None,
 			capacity: Resources {
 				millicpu: 0,
 				memory_mb: 4096,

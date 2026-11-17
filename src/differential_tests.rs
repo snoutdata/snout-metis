@@ -68,6 +68,7 @@ fn host(rng: &mut Rng, i: usize) -> HostSpec {
 			memory_mb: 8192,
 		}),
 		owner: rng.chance(10).then(|| "owner-1".to_string()),
+		room: None,
 	}
 }
 

@@ -129,3 +129,35 @@ fn a_home_under_pressure_is_not_moved_to() {
 		outcome.notes
 	);
 }
+
+/// Measured room (sql/396): a server whose capacity came from measurement says so when it is full, and
+/// is placed by its capacity alone, as any other.
+#[test]
+fn a_measured_servers_shortfall_says_its_room_was_measured() {
+	let mut measured = host("h1", "a", 100);
+	measured.room = Some("measured".into());
+	measured.server = Some(mb(1859));
+	let s = spec(
+		vec![measured, host("h2", "b", 100)],
+		vec![service("e", "psyche", 2, 128)],
+	);
+	let outcome = decide(&s, &facts(vec![("h1", vec![]), ("h2", vec![])]));
+	assert!(
+		said(
+			&outcome,
+			"h1 100 of 100 MB free, of a 1859 MB server, measured room"
+		),
+		"{:?}",
+		outcome.notes
+	);
+	assert!(
+		said(&outcome, "h2 100 of 100 MB free)"),
+		"{:?}",
+		outcome.notes
+	);
+	assert_eq!(
+		outcome.shortfalls[0].hosts[0].room.as_deref(),
+		Some("measured")
+	);
+	assert_eq!(outcome.shortfalls[0].hosts[1].room, None);
+}

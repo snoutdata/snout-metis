@@ -137,6 +137,7 @@ impl<'a, 'w> Gate<'a, 'w> {
 					capacity: h.capacity,
 					free: room.left(h.name.as_str()),
 					server: h.server,
+					room: h.room.clone(),
 				})
 			})
 			.collect()
@@ -160,16 +161,22 @@ pub(super) fn refusal_summary(refused: &[Refusal], needs: Resources) -> String {
 				.iter()
 				.take(5)
 				.map(|r| match r.reason {
-					Refused::Full if r.free.memory_mb < needs.memory_mb => match r.server {
-						Some(server) if server.memory_mb > r.capacity.memory_mb => format!(
-							"{} {} of {} MB free, of a {} MB server",
-							r.host, r.free.memory_mb, r.capacity.memory_mb, server.memory_mb
-						),
-						_ => format!(
-							"{} {} of {} MB free",
-							r.host, r.free.memory_mb, r.capacity.memory_mb
-						),
-					},
+					Refused::Full if r.free.memory_mb < needs.memory_mb => {
+						let measure = match r.room.as_deref() {
+							Some(room) => format!(", {room} room"),
+							None => String::new(),
+						};
+						match r.server {
+							Some(server) if server.memory_mb > r.capacity.memory_mb => format!(
+								"{} {} of {} MB free, of a {} MB server{measure}",
+								r.host, r.free.memory_mb, r.capacity.memory_mb, server.memory_mb
+							),
+							_ => format!(
+								"{} {} of {} MB free{measure}",
+								r.host, r.free.memory_mb, r.capacity.memory_mb
+							),
+						}
+					}
 					Refused::Full => format!(
 						"{} {} of {} millicpu free",
 						r.host, r.free.millicpu, r.capacity.millicpu
