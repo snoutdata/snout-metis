@@ -444,14 +444,31 @@ fn the_rebalancer_moves_one_environment_off_the_busiest_host_make_before_break()
 	assert_eq!(on(&second, "h1", "e1"), 1);
 	assert_eq!(second.moves, first.moves, "still in flight");
 
-	// 3: h3's copy runs steady: h1's goes, the move is done, and no other starts in the same decision.
+	// 3: h3's copy runs steady: h1's goes. h1 still runs it until its agent stops it, so the move stays
+	// in flight and h1 stays off e1's hosts: over, the next decision would see e1 on both and keep h1's.
 	let mut done = lopsided_facts();
 	done.moves = first.moves.clone();
 	done.hosts[2].copies.push(steady("e1", "x", "1.0", None));
 	let third = decide(&s, &done);
 	assert_eq!(on(&third, "h1", "e1"), 0, "{:?}", third.notes);
 	assert_eq!(on(&third, "h3", "e1"), 1);
-	assert!(third.moves.is_empty());
+	assert_eq!(third.moves, first.moves, "in flight while h1 still runs it");
+	let again = decide(&s, &done);
+	assert_eq!((on(&again, "h1", "e1"), on(&again, "h3", "e1")), (0, 1), "never back to h1");
+
+	// What carrying it prevents: the same facts with the move over keep h1's copy and drop h3's.
+	let mut over = done.clone();
+	over.moves.clear();
+	let flipped = decide(&s, &over);
+	assert_eq!((on(&flipped, "h1", "e1"), on(&flipped, "h3", "e1")), (1, 0));
+
+	// 4: h1's agent stopped it: the move is done, e1 on h3 alone, and no other starts in the same decision.
+	let mut gone = done.clone();
+	gone.hosts[0].copies.retain(|c| c.environment != "e1");
+	let fourth = decide(&s, &gone);
+	assert_eq!(on(&fourth, "h1", "e1"), 0, "{:?}", fourth.notes);
+	assert_eq!(on(&fourth, "h3", "e1"), 1);
+	assert!(fourth.moves.is_empty());
 }
 
 #[test]

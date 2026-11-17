@@ -17,6 +17,8 @@ pub mod decide;
 mod decide_before;
 #[cfg(test)]
 mod differential_tests;
+#[cfg(test)]
+mod fix_tests;
 pub mod member;
 #[cfg(test)]
 mod orchestration_tests;

@@ -59,11 +59,6 @@ impl<'a> Room<'a> {
 			*free = free.plus(per_copy);
 		}
 	}
-
-	/// What is left after `n` more copies on `host`, without taking it.
-	pub fn left_after(&self, host: &str, per_copy: Resources, n: u32) -> Resources {
-		after(self.free[host], per_copy, n)
-	}
 }
 
 /// `left` less `n` copies, one at a time (each never below nothing).
@@ -83,7 +78,7 @@ pub(super) fn fitting(left: Resources, per_copy: Resources, most: u32) -> u32 {
 }
 
 /// One service's copies chosen so far: host -> version -> copies.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub(super) struct Chosen<'a> {
 	by_host: BTreeMap<&'a str, BTreeMap<&'a str, u32>>,
 }
@@ -102,10 +97,15 @@ impl<'a> Chosen<'a> {
 
 	/// One copy fewer of `version` on `host` (one that was added).
 	pub fn remove_one(&mut self, host: &str, version: &str) {
-		let versions = self.by_host.get_mut(host).expect("added there");
-		let n = versions.get_mut(version).expect("added there");
-		*n -= 1;
-		if *n == 0 {
+		self.remove(host, version, 1);
+	}
+
+	/// `n` copies fewer of `version` on `host`, which holds at least that many.
+	pub fn remove(&mut self, host: &str, version: &str, n: u32) {
+		let versions = self.by_host.get_mut(host).expect("chosen there");
+		let left = versions.get_mut(version).expect("chosen there");
+		*left -= n;
+		if *left == 0 {
 			versions.remove(version);
 		}
 	}

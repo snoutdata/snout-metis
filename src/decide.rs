@@ -235,14 +235,18 @@ pub fn decide(spec: &Spec, facts: &Facts) -> Outcome {
 	}
 	board.placement.sort();
 
-	// A move in flight stays until no copy of its environment is held on `from`; then a new one may
-	// start, from this decision's placement, once everything runs steady.
+	// A move in flight stays while a copy of its environment is held on `from`, and after that while
+	// `from` still runs one: let go is not yet gone, and with the move over the next decision would
+	// see the copy on both hosts and could keep the one on `from` (2026-11-17, the orchestration
+	// drill's flake). Then a new one may start, from this decision's placement, once everything runs
+	// steady.
 	let mut next_moves: Vec<Move> = moves
 		.iter()
 		.filter(|m| {
 			board
 				.still_moving
 				.contains(&(m.environment.as_str(), m.from.as_str()))
+				|| world.still_runs(&m.from, &m.environment)
 		})
 		.map(|m| (*m).clone())
 		.collect();

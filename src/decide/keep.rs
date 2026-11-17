@@ -28,6 +28,8 @@ pub(super) struct ServicePlan<'a, 'w> {
 	pub eligible: Vec<&'a HostSpec>,
 	/// Its policy packs: the home first, up to `cap` copies there, one on any other host.
 	pub pack: bool,
+	/// Packing, its home when a new copy may go there.
+	pub home: Option<&'a str>,
 	pub chosen: Chosen<'a>,
 	/// What runs and waits for its handover, in the order found.
 	pub holds: Vec<Hold<'a>>,
@@ -114,9 +116,12 @@ pub(super) fn keep<'a, 'w>(
 			});
 		}
 	}
-	// Packing starts at the database's own host (the project's home) while it has room.
+	// Packing gathers copies on the database's own host (the project's home), when a new copy may go
+	// there: one held or under pressure would never get them.
 	let home = gate.database.host.filter(|h| {
-		pack && !world.report_only.contains(h) && eligible.iter().any(|e| e.name == *h)
+		pack && eligible
+			.iter()
+			.any(|e| e.name == *h && gate.closed(e).is_none())
 	});
 	let mut chosen = Chosen::default();
 	let mut kept_of = Vec::with_capacity(targets.len());
@@ -150,15 +155,13 @@ pub(super) fn keep<'a, 'w>(
 				.then(a.0.cmp(b.0))
 		});
 		let mut kept = 0;
-		// Copies the home is holding room for, from hosts they move off.
-		let mut reserved = 0;
 		let ran = existing.clone();
 		for (host, n) in existing {
 			let share = gate.share_left(host, &chosen);
 			let wanted_here = n.min(target - kept).min(share);
 			// Each copy kept takes its own room: a host holds no more running copies than fit, and the
 			// rest are placed elsewhere and held here until those run steady.
-			let mut take = fitting(room.left(host), service.per_copy, wanted_here);
+			let take = fitting(room.left(host), service.per_copy, wanted_here);
 			if take < wanted_here {
 				holds.push(Hold {
 					host,
@@ -167,18 +170,6 @@ pub(super) fn keep<'a, 'w>(
 					why: Why::NoRoom,
 				});
 			}
-			if let Some(home) = home
-				&& host != home
-				&& !world.report_only.contains(host)
-			{
-				// A copy off the home moves there while the home has room: placed there, and kept here
-				// until that one runs steady.
-				let at_home = room.left_after(home, service.per_copy, reserved);
-				let open = gate.share_left(home, &chosen).saturating_sub(reserved);
-				let moving = fitting(at_home, service.per_copy, take.min(open));
-				take -= moving;
-				reserved += moving;
-			}
 			room.take(host, service.per_copy, take);
 			chosen.add(host, version, take);
 			kept += take;
@@ -186,16 +177,22 @@ pub(super) fn keep<'a, 'w>(
 				break;
 			}
 		}
-		// Packing: what runs off the home and is not kept moves to it, and stays where it runs until the
-		// home's copies run steady.
+		// Packing: what runs off the home and is not kept (the home's were kept first) is moving there,
+		// and stays where it runs until the copies chosen run steady.
 		if let Some(home) = home {
 			for (host, n) in ran {
-				let kept_there = chosen.count(host, version);
-				if host != home && !world.report_only.contains(host) && n > kept_there {
+				// Kept, or already held there for want of room: each running copy is held once at most.
+				let no_room: u32 = holds
+					.iter()
+					.filter(|h| h.host == host && h.version == *version && h.why == Why::NoRoom)
+					.map(|h| h.copies)
+					.sum();
+				let accounted = chosen.count(host, version) + no_room;
+				if host != home && !world.report_only.contains(host) && n > accounted {
 					holds.push(Hold {
 						host,
 						version,
-						copies: n - kept_there,
+						copies: n - accounted,
 						why: Why::ToHome(home),
 					});
 				}
@@ -212,6 +209,7 @@ pub(super) fn keep<'a, 'w>(
 		gate,
 		eligible,
 		pack,
+		home,
 		chosen,
 		holds,
 		prefer,

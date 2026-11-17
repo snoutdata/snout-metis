@@ -97,6 +97,10 @@ impl<'a, 'w> Gate<'a, 'w> {
 		let name = h.name.as_str();
 		self.bars(h).or(if h.frozen {
 			Some(Refused::Frozen)
+		} else if h.draining {
+			// A draining host that still serves (no spec the control plane writes, but nothing refuses
+			// one) keeps what runs there and takes nothing new.
+			Some(Refused::Draining)
 		} else if self.world.report_only.contains(name) {
 			Some(Refused::OnlyReports)
 		} else if self.pressured.contains(name) {

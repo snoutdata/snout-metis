@@ -129,7 +129,11 @@ impl<'a> Roll<'a, '_> {
 					.addable
 					.iter()
 					.copied()
-					.filter(|h| chosen.on_host(h.name.as_str()) == 0)
+					// Holding none: nothing chosen there, and no old copy there on its way out (a host
+					// later in this roll may keep its old copy, and would hold two, 2026-11-17).
+					.filter(|h| {
+						chosen.on_host(h.name.as_str()) == 0 && !changing.contains(h.name.as_str())
+					})
 					.collect();
 				if let Some(to) =
 					best_host(&fresh, self.gate, chosen, room, self.pack, self.with, None)

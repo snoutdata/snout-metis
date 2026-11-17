@@ -1,6 +1,7 @@
 //! TEST ONLY: `decide.rs` as it was at d9a1d3095, before it was split into its steps. The differential
 //! test (`differential_tests.rs`) runs this and the new `decide` over generated and logged inputs and
-//! requires the same outcome, byte for byte. Deleted once the refactor has been live a while.
+//! requires the same outcome, byte for byte (34d65b1c9), or a difference one of the fixes made since
+//! explains (`fixed`). Deleted once the new core has been live a while.
 #![allow(dead_code, clippy::all)]
 
 use crate::spec::{

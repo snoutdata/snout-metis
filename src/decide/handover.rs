@@ -2,14 +2,19 @@
 //! that runs where it should no longer be stays placed, and so routed, until what replaces it runs
 //! steady; then it is let go. Four reasons a copy is in that position, one rule for all of them:
 //!
-//! | why          | replaced once                                | its room while held              |
-//! |--------------|----------------------------------------------|----------------------------------|
-//! | `ToHome`     | the home's copies of its version run steady  | counted (taken now)              |
-//! | `NoRoom`     | the service's chosen copies run steady       | not counted: there is none       |
-//! | `Draining`   | the service's chosen copies run steady       | not counted: the host serves none|
-//! | `MovingOff`  | the service's chosen copies run steady       | counted (taken when kept), given back when let go |
+//! It is replaced once the copies chosen for the service, the held ones aside, run steady: a held copy
+//! is never its own replacement. What differs is its room while held:
 //!
-//! A held `NoRoom` or `MovingOff` copy also holds the rebalancer's move in flight (`still_moving`).
+//! | why          | its room while held                                                   |
+//! |--------------|-----------------------------------------------------------------------|
+//! | `ToHome`     | counted from the start of the second pass, given back when let go     |
+//! | `NoRoom`     | not counted: there is none                                            |
+//! | `Draining`   | not counted: the host serves none                                     |
+//! | `MovingOff`  | counted (taken when kept), given back when let go                     |
+//!
+//! A `ToHome` or `NoRoom` copy is chosen where it runs from the start of the second pass, so no other
+//! copy of the service is added beside it there; the others are chosen only when kept. A held `NoRoom` or
+//! `MovingOff` copy also holds the rebalancer's move in flight (`still_moving`).
 
 use super::note::Note;
 use super::room::{Chosen, Room};
@@ -60,17 +65,24 @@ impl<'a> Handover<'a, '_> {
 		let (id, h, v) = (self.id.to_string(), host.to_string(), version.to_string());
 		if replaced {
 			match why {
-				Why::ToHome(home) => self.notes.push(Note::MovedHome {
-					id,
-					host: h,
-					version: v,
-					home: home.to_string(),
-				}),
-				Why::NoRoom => self.notes.push(Note::MovedNoRoom {
-					id,
-					host: h,
-					version: v,
-				}),
+				Why::ToHome(home) => {
+					self.chosen.remove(host, version, copies);
+					self.room.give(host, self.per_copy, copies);
+					self.notes.push(Note::MovedHome {
+						id,
+						host: h,
+						version: v,
+						home: home.to_string(),
+					});
+				}
+				Why::NoRoom => {
+					self.chosen.remove(host, version, copies);
+					self.notes.push(Note::MovedNoRoom {
+						id,
+						host: h,
+						version: v,
+					});
+				}
 				Why::Draining => {}
 				Why::MovingOff => {
 					self.room.give(host, self.per_copy, copies);
@@ -83,10 +95,9 @@ impl<'a> Handover<'a, '_> {
 			}
 			return;
 		}
-		if let Why::ToHome(_) = why {
-			self.room.take(host, self.per_copy, copies);
+		if !matches!(why, Why::ToHome(_) | Why::NoRoom) {
+			self.chosen.add(host, version, copies);
 		}
-		self.chosen.add(host, version, copies);
 		if matches!(why, Why::NoRoom | Why::MovingOff) {
 			self.still_moving.insert((self.environment, host));
 		}

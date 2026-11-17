@@ -88,11 +88,9 @@ pub(super) fn pick_move(
 			}
 		}
 	}
-	if spec
-		.hosts
-		.iter()
-		.any(|h| (h.draining || h.finishing) && alive.contains(h.name.as_str()))
-		|| !rollbacks.is_empty()
+	if spec.hosts.iter().any(|h| {
+		(h.draining || world.finishing.contains(h.name.as_str())) && alive.contains(h.name.as_str())
+	}) || !rollbacks.is_empty()
 	{
 		return None;
 	}

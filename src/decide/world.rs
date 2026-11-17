@@ -116,6 +116,20 @@ impl<'a> World<'a> {
 			&& !self.report_only.contains(h.name.as_str())
 	}
 
+	/// `host` reports a copy of one of the environment's services that its agent has not given up on.
+	pub fn still_runs(&self, host: &str, environment: &str) -> bool {
+		self.spec
+			.services
+			.iter()
+			.filter(|s| s.environment == environment)
+			.any(|s| {
+				self.copies
+					.on(host, s)
+					.iter()
+					.any(|c| c.state != CopyState::GaveUp)
+			})
+	}
+
 	/// The service's copies running on `host`, by version.
 	pub fn running_versions(&self, host: &str, service: &ServiceSpec) -> BTreeMap<&'a str, u32> {
 		let mut out = BTreeMap::new();
