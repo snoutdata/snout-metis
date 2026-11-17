@@ -13,12 +13,16 @@
 pub mod compile;
 pub mod database;
 pub mod decide;
+#[cfg(test)]
+mod decide_before;
+#[cfg(test)]
+mod differential_tests;
 pub mod member;
 #[cfg(test)]
 mod orchestration_tests;
+pub mod replay;
 #[cfg(test)]
 mod shortfall_tests;
-pub mod replay;
 pub mod spec;
 
 pub use database::{DatabasePrimary, DatabaseReport, DatabaseRole, database_primary};
