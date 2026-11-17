@@ -70,6 +70,26 @@ fn a_dedicated_service_names_the_shared_hosts_it_never_uses() {
 }
 
 #[test]
+fn a_silent_host_the_service_could_never_use_is_named_for_that_not_for_its_silence() {
+	// bamboo's alert, 2026-11-17: sd-4816k33e (shared, its agent not reporting to the fleet's
+	// members) was named "not reporting" for a dedicated project that may never use it, and the hint
+	// blamed it instead of the full pool servers.
+	let mut own = host("h2", "b", 300);
+	own.dedicated_to = Some("acme".into());
+	let mut svc = service("p", "api", 2, 256);
+	svc.dedicated_to = Some("acme".into());
+	let out = decide(
+		&spec(vec![host("h1", "a", 4096), own], vec![svc]),
+		&facts(vec![("h2", vec![])]),
+	);
+	assert_eq!(
+		reasons(&out),
+		vec![("h1".into(), Refused::Shared), ("h2".into(), Refused::HoldsItsShare)]
+	);
+	assert!(!said(&out, "not reporting"), "{:?}", out.notes);
+}
+
+#[test]
 fn silent_draining_and_given_up_hosts_say_so() {
 	let mut draining = host("h2", "b", 4096);
 	draining.draining = true;

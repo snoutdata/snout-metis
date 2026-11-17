@@ -107,8 +107,6 @@ pub struct Refusal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Refused {
-	/// Not heard within the host timeout.
-	NotReporting,
 	/// Dedicated to another customer.
 	Dedicated,
 	/// A shared host, and the service runs only on its customer's dedicated hosts.
@@ -116,6 +114,9 @@ pub enum Refused {
 	/// Not on the service's list of hosts or regions (`placement`). On the fleet, a pool's servers
 	/// are kept off a shared project's list this way (sql/337).
 	NotOnItsList,
+	/// Not heard within the host timeout. After the three above: a host the service could never use
+	/// is that, not silent (2026-11-17: bamboo's alert blamed a silent shared host it may not use).
+	NotReporting,
 	/// Being emptied to retire.
 	Draining,
 	/// Serves nothing (a witness host, or closed).
@@ -899,9 +900,7 @@ fn refusals(
 			let on_database = why.database == Some(name);
 			let cap = if on_database { why.cap } else { 1 };
 			let left = free[name];
-			let reason = if !why.alive.contains(name) {
-				Refused::NotReporting
-			} else if h.dedicated_to != service.dedicated_to {
+			let reason = if h.dedicated_to != service.dedicated_to {
 				if h.dedicated_to.is_some() {
 					Refused::Dedicated
 				} else {
@@ -909,6 +908,8 @@ fn refusals(
 				}
 			} else if !service.placement.allows(h) {
 				Refused::NotOnItsList
+			} else if !why.alive.contains(name) {
+				Refused::NotReporting
 			} else if !(h.serves || h.frozen || (h.serves_home && !h.draining && on_database)) {
 				if h.draining {
 					Refused::Draining
