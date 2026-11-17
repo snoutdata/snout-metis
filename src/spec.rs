@@ -232,9 +232,9 @@ pub struct ServiceSpec {
 	/// [`Qos`]. None: it may use more than it reserves (burstable), or reserves nothing (best effort).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub limit: Option<Resources>,
-	/// Higher is placed first, and takes the room of lower ones when there is none left (preemption):
-	/// their copies on that host go, and are placed elsewhere if anywhere has room. 0, the default,
-	/// never preempts anything.
+	/// Higher keeps and takes room first, when room is short. It never takes a running copy's room:
+	/// no copy is evicted for a higher priority (Joel, 2026-11-17: a free project is lower, never
+	/// dispensable). 0 is the default.
 	#[serde(default, skip_serializing_if = "is_zero_u32")]
 	pub priority: u32,
 	#[serde(default, skip_serializing_if = "Option::is_none")]

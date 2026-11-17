@@ -140,10 +140,14 @@ holds their cases):
   more than that share of its capacity (the agents' `load`) has copies moved off it: best effort
   first, then burstable by how far past its request it runs, the lowest priority first, never a
   guaranteed or one-clock copy, and nothing new placed there. Make before break, as a drain.
-- **Priority and preemption.** A service's `priority` (0 to `MAX_PRIORITY`) is the order services
-  keep and take room in. When no host has room for a copy of a priority above 0, it takes the room
-  of the fewest, lowest-priority copies on one host (strictly lower only); they are placed elsewhere
-  in their own turn if anywhere has room, and the note says who gave way to whom.
+- **Priority, never an eviction.** A service's `priority` (0 to `MAX_PRIORITY`) is the order services
+  keep and take room in, when room is short. It never takes a running copy's room: a higher priority
+  with no room left is a shortfall, never a lower one stopped (Joel, 2026-11-17: a free project is
+  lower, never dispensable).
+- **Each kept copy needs its own room.** A host keeps no more of what runs there than fits; a copy
+  past its room is placed elsewhere and stays where it runs, placed and routed, until the copies
+  elsewhere run steady (make before break), and where nothing else has room it stays and the decision
+  says so as a shortfall.
 - **The rebalancer.** With `rebalance` (`high_percent`, `low_percent`), once every placed copy runs
   steady and nothing else moves, one environment's copies on the most reserved host past
   `high_percent` move to the least reserved host under `low_percent` that can take them all (each

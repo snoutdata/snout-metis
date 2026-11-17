@@ -1,5 +1,5 @@
 //! Table-driven cases for what Metis borrows from Kubernetes (MT7): requests and limits (QoS) and
-//! eviction under pressure, priority and preemption, the rebalancer, and rollouts with a surge, more
+//! eviction under pressure, priority (never an eviction), the rebalancer, and rollouts with a surge, more
 //! than one host at a time, and a rollback. Every one is opt-in: a spec without the fields decides as
 //! before (the rest of `decide.rs`'s tests).
 
@@ -311,7 +311,7 @@ fn without_a_pressure_percent_load_moves_nothing() {
 	assert_eq!(on(&outcome, "h2", "be"), 0);
 }
 
-// ---- Priority and preemption ----
+// ---- Priority: who keeps and takes room first; never an eviction ----
 
 fn crowded(priority: u32) -> Spec {
 	let low = service("low", "x", 1, 400);
@@ -321,43 +321,28 @@ fn crowded(priority: u32) -> Spec {
 }
 
 #[test]
-fn a_higher_priority_takes_a_lower_ones_room_when_there_is_none() {
+fn a_higher_priority_never_takes_a_running_copys_room() {
+	// Joel, 2026-11-17: nothing is evictable; a free project is lower, never dispensable.
 	let outcome = decide(
-		&crowded(10),
+		&crowded(400),
 		&facts(vec![("h1", vec![steady("low", "x", "1.0", None)])]),
 	);
-	assert_eq!(on(&outcome, "h1", "high"), 1, "{:?}", outcome.notes);
-	assert_eq!(on(&outcome, "h1", "low"), 0);
-	assert!(said(
-		&outcome,
-		"low/x: its copy of 1.0 on h1 gives way to high/x (priority 10 over 0)"
-	));
-	assert!(said(&outcome, "low/x: wanted 1 copies of 1.0, placed 0"));
-
-	// The next decision, with the high copy starting there, is the same: no flapping.
-	let outcome = decide(
-		&crowded(10),
-		&facts(vec![(
-			"h1",
-			vec![
-				steady("low", "x", "1.0", None),
-				with_state(steady("high", "x", "1.0", None), CopyState::Starting),
-			],
-		)]),
-	);
-	assert_eq!(on(&outcome, "h1", "high"), 1);
-	assert_eq!(on(&outcome, "h1", "low"), 0);
+	assert_eq!(on(&outcome, "h1", "low"), 1, "{:?}", outcome.notes);
+	assert_eq!(on(&outcome, "h1", "high"), 0);
+	assert!(said(&outcome, "high/x: wanted 1 copies of 1.0, placed 0"));
+	assert!(!outcome.notes.iter().any(|n| n.contains("gives way")));
 }
 
 #[test]
-fn priority_zero_never_preempts_and_room_elsewhere_is_used_first() {
-	let outcome = decide(
-		&crowded(0),
-		&facts(vec![("h1", vec![steady("low", "x", "1.0", None)])]),
-	);
-	assert_eq!(on(&outcome, "h1", "low"), 1);
-	assert_eq!(on(&outcome, "h1", "high"), 0);
+fn a_higher_priority_takes_free_room_first_and_room_elsewhere_is_used() {
+	// Neither runs and h1 has room for one: the higher priority takes it, whatever the ids say.
+	let mut first = crowded(10);
+	first.services[0].environment = "a".into();
+	first.services[1].environment = "z".into();
+	let outcome = decide(&first, &facts(vec![("h1", vec![])]));
+	assert_eq!((on(&outcome, "h1", "z"), on(&outcome, "h1", "a")), (1, 0), "{:?}", outcome.notes);
 
+	// With room on another host, both are placed and nothing moves.
 	let mut roomy = crowded(10);
 	roomy.hosts.push(host("h2", "b", 512));
 	let outcome = decide(
@@ -372,62 +357,24 @@ fn priority_zero_never_preempts_and_room_elsewhere_is_used_first() {
 }
 
 #[test]
-fn a_preempted_service_is_placed_elsewhere_when_another_host_has_room() {
+fn the_higher_priority_keeps_first_when_a_host_shrinks_and_the_other_is_never_stopped() {
+	// h1 shrank to 512 MB with both copies running there. The higher priority's is kept in the room;
+	// the lower one has none, so it is placed on h2 and held on h1 until that one runs steady.
 	let mut s = crowded(10);
 	s.hosts.push(host("h2", "b", 512));
-	// h2 is busy with a third service of the same priority as `high`, so `high` must preempt on h1.
-	let mut peer = service("peer", "x", 1, 400);
-	peer.priority = 10;
-	s.services.push(peer);
-	s.hosts.push(host("h3", "c", 512));
-	let outcome = decide(
-		&s,
-		&facts(vec![
-			("h1", vec![steady("low", "x", "1.0", None)]),
-			("h2", vec![steady("peer", "x", "1.0", None)]),
-			("h3", vec![]),
-		]),
-	);
-	// h3 is empty, so no preemption is needed at all.
-	assert_eq!(on(&outcome, "h3", "high"), 1, "{:?}", outcome.notes);
-	assert_eq!(on(&outcome, "h1", "low"), 1);
+	let both = vec![
+		steady("low", "x", "1.0", None),
+		steady("high", "x", "1.0", None),
+	];
+	let outcome = decide(&s, &facts(vec![("h1", both.clone()), ("h2", vec![])]));
+	assert_eq!(on(&outcome, "h1", "high"), 1, "{:?}", outcome.notes);
+	assert_eq!(on(&outcome, "h2", "low"), 1);
+	assert_eq!(on(&outcome, "h1", "low"), 1, "held until h2's runs steady");
 
-	// With h3 holding a low copy too, `high` takes one of them, and the low one moves where it can.
-	let mut tight = s.clone();
-	tight.services.push(service("low2", "x", 1, 400));
-	let outcome = decide(
-		&tight,
-		&facts(vec![
-			("h1", vec![steady("low", "x", "1.0", None)]),
-			("h2", vec![steady("peer", "x", "1.0", None)]),
-			("h3", vec![steady("low2", "x", "1.0", None)]),
-		]),
-	);
-	assert_eq!(
-		on(&outcome, "h1", "high") + on(&outcome, "h3", "high"),
-		1,
-		"{:?}",
-		outcome.notes
-	);
-	assert!(said(&outcome, "gives way to high/x"));
-	assert_eq!(on(&outcome, "h2", "peer"), 1, "never an equal priority");
-}
-
-#[test]
-fn the_higher_priority_keeps_first_when_a_host_shrinks() {
-	// h1 shrank to 512 MB with both copies running there: the higher priority's is the one kept.
-	let outcome = decide(
-		&crowded(10),
-		&facts(vec![(
-			"h1",
-			vec![
-				steady("low", "x", "1.0", None),
-				steady("high", "x", "1.0", None),
-			],
-		)]),
-	);
-	assert_eq!(on(&outcome, "h1", "high"), 1);
-	assert_eq!(on(&outcome, "h1", "low"), 0);
+	// No other host: it stays where it runs, and the shortfall says so.
+	let outcome = decide(&crowded(10), &facts(vec![("h1", both)]));
+	assert_eq!((on(&outcome, "h1", "high"), on(&outcome, "h1", "low")), (1, 1));
+	assert!(said(&outcome, "low/x: wanted 1 copies of 1.0, placed 0"));
 }
 
 // ---- The rebalancer ----
